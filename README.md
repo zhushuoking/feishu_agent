@@ -173,6 +173,11 @@ worker.bat     :: 另一个窗口，定时提醒
 
 Python 3.11 · lark-oapi（长连接）· SQLAlchemy 2 + SQLite · Pydantic v2 · httpx · pytest
 
+## 更多文档
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 逐个文件讲清楚它是干什么的、删了会怎样、
+  踩过哪些坑，以及和 Java/Spring 里哪个概念对应
+
 ## 说明
 
 这是个人练手项目，按一份详细设计说明书逐步实现，目的是把一条完整的业务链路跑通并踩到真实问题
