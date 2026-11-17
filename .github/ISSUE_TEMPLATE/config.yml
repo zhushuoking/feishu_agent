@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 先看协作指南
+    url: https://github.com/zhushuoking/feishu_agent/blob/main/CONTRIBUTING.md
+    about: 分支怎么走、提交前查什么、为什么两个人不能用同一个 App ID
+  - name: 查是不是已经踩过的坑
+    url: https://github.com/zhushuoking/feishu_agent/blob/main/docs/ARCHITECTURE.md
+    about: 逐文件说明 + 已知问题，很多「跑不通」在这里有答案
