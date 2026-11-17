@@ -177,6 +177,8 @@ Python 3.11 · lark-oapi（长连接）· SQLAlchemy 2 + SQLite · Pydantic v2 �
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 逐个文件讲清楚它是干什么的、删了会怎样、
   踩过哪些坑，以及和 Java/Spring 里哪个概念对应
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 一起改这个仓库之前先读：分支怎么走、提交前查什么、
+  以及**为什么两个人不能用同一个 App ID 同时跑**
 
 ## 说明
 
