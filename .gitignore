@@ -1,0 +1,33 @@
+# ---- 凭证与本地配置（绝不提交）----
+.env
+key.txt
+*.key
+key.*
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+
+# ---- 数据库与运行时产物 ----
+*.db
+*.db-shm
+*.db-wal
+*.sqlite3
+*.log
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.swp
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store

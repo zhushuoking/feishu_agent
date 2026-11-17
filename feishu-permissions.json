@@ -1,0 +1,14 @@
+{
+  "scopes": {
+    "tenant": [
+      "contact:user.base:readonly",
+      "im:chat:readonly",
+      "im:message",
+      "im:message.p2p_msg:readonly",
+      "im:message.group_at_msg:readonly",
+      "im:message.group_msg",
+      "im:message:send_as_bot",
+      "im:resource"
+    ]
+  }
+}
