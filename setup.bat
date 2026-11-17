@@ -6,15 +6,17 @@ echo ============================================
 echo  飞书任务跟进 Agent - 环境初始化
 echo ============================================
 
-set PY311=C:\Users\48639\anaconda3\envs\tf_env2\python.exe
+rem 想指定解释器就改下面这行，例如 set "PYTHON=C:\Python311\python.exe"
+rem 留空则依次尝试 py -3.11 / python。建议 3.11 或 3.12。
+set "PYTHON="
 
 if not exist ".venv" (
-    echo [1/3] 创建虚拟环境 Python 3.11 ...
-    if exist "%PY311%" (
-        "%PY311%" -m venv .venv
+    echo [1/3] 创建虚拟环境 ...
+    if defined PYTHON (
+        "%PYTHON%" -m venv .venv
     ) else (
-        echo      未找到 3.11 解释器，改用 PATH 里的 python
-        python -m venv .venv
+        py -3.11 -m venv .venv >nul 2>&1
+        if errorlevel 1 python -m venv .venv
     )
     if errorlevel 1 goto :fail
 ) else (
@@ -30,7 +32,7 @@ if errorlevel 1 goto :fail
 echo [3/3] 检查 .env ...
 if not exist ".env" (
     copy .env.example .env >nul
-    echo      已生成 .env，接下来请填入 App ID / App Secret
+    echo      已生成 .env，接下来请填 App ID / App Secret / 模型配置
     start "" notepad .env
 ) else (
     echo      .env 已存在，跳过
