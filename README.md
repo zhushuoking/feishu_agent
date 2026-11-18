@@ -175,8 +175,11 @@ Python 3.11 · lark-oapi（长连接）· SQLAlchemy 2 + SQLite · Pydantic v2 �
 
 ## 更多文档
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 逐个文件讲清楚它是干什么的、删了会怎样、
-  踩过哪些坑，以及和 Java/Spring 里哪个概念对应
+- [`docs/CODE_WALKTHROUGH.md`](docs/CODE_WALKTHROUGH.md) —— **代码导读（详细版）**。
+  四层结构、一条消息的完整旅程、逐层精讲关键代码、数据库字段、十个设计决策、
+  测试怎么读，以及「想改某处该动哪个文件」
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 文件清单速查：每个文件干什么、
+  删了会怎样、踩过哪些坑，以及和 Java/Spring 里哪个概念对应
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 一起改这个仓库之前先读：分支怎么走、提交前查什么、
   以及**为什么两个人不能用同一个 App ID 同时跑**
 
