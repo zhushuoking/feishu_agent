@@ -69,6 +69,23 @@ def test_block_notifies_creator(task):
     assert [r.receive_id for r in rows] == [CREATOR]
 
 
+def test_unblock_also_notifies_creator(task):
+    """解除阻塞必须也说一声。
+
+    发起人上一秒刚被告知「卡住了」，不告诉他通了，他的认知就永远停在
+    「卡住了」——下次还得来问「这事儿通了没」，通知就白发了。
+    """
+    repo.transition_task(task.uid, "start", operator_open_id=OWNER)
+    repo.transition_task(task.uid, "block", operator_open_id=OWNER)
+    repo.transition_task(task.uid, "unblock", operator_open_id=OWNER)
+
+    rows = [r for r in _notifications() if r.kind == "task_event"]
+    assert [r.receive_id for r in rows] == [CREATOR, CREATOR]
+    assert ":block:" in rows[0].dedupe_key
+    assert ":unblock:" in rows[1].dedupe_key
+    assert "解除了阻塞" in rows[1].payload
+
+
 def test_cancel_notifies_owner(task):
     repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR)
 

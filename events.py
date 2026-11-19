@@ -20,9 +20,10 @@
 | 动作 | 告诉谁 | 为什么 |
 |---|---|---|
 | 提交验收 | 发起人 | 轮到他验收了，不告诉他任务就停在这儿 |
+| 报阻塞 | 发起人 | 阻塞往往要发起人去协调资源 |
+| 解除阻塞 | 发起人 | 他刚被告知「卡住了」，通了得说一声 |
 | 验收通过 | 负责人 | 他要知道自己这活儿结没结 |
 | 验收打回 | 负责人 | 要返工，必须立刻知道，且要看到打回原因 |
-| 报阻塞 | 发起人 | 阻塞往往要发起人去协调资源 |
 | 取消 | 负责人 | 别再做了 |
 | 开始处理 | 不发 | 他自己点的，通知他自己没意义 |
 
@@ -43,8 +44,15 @@ SUMMARIES = {
     "accept": "验收通过，任务已完成",
     "reject": "打回了验收，需要继续处理",
     "block": "把任务标记为阻塞",
+    # 解除阻塞也要说一声：发起人上一秒刚被告知「卡住了」，
+    # 不告诉他通了，他的认知就永远停在「卡住了」，下次还得来问。
+    "unblock": "解除了阻塞，可以继续了",
     "cancel": "取消了任务",
 }
+
+# 这些动作的收件人是「发起人」，其余是「负责人」。
+# 单独抽出来是因为 recipients() 和语义都靠它，散在两处就会漏。
+CREATOR_ACTIONS = frozenset({"submit", "block", "unblock"})
 
 # 只有这些动作会触发通知。加动作就往这里加。
 NOTIFY_ACTIONS = frozenset(SUMMARIES)
@@ -64,7 +72,7 @@ def event_key(task_uid: str, action: str, version: int, open_id: str) -> str:
 
 def recipients(task, action: str, operator_open_id: str = "") -> List[str]:
     """这条变更该告诉谁。空值过滤 + 去重保序 + 不通知操作者本人。"""
-    if action in ("submit", "block"):
+    if action in CREATOR_ACTIONS:
         targets = [task.creator_open_id]
     else:
         targets = list(task.owner_open_ids)
