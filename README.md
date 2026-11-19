@@ -180,6 +180,8 @@ Python 3.11 · lark-oapi（长连接）· SQLAlchemy 2 + SQLite · Pydantic v2 �
   测试怎么读，以及「想改某处该动哪个文件」
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) —— 文件清单速查：每个文件干什么、
   删了会怎样、踩过哪些坑，以及和 Java/Spring 里哪个概念对应
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) —— 端到端验收清单（15 条必测场景）+
+  3 分钟演示分镜。改完核心逻辑后照着走一遍
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) —— 一起改这个仓库之前先读：分支怎么走、提交前查什么、
   以及**为什么两个人不能用同一个 App ID 同时跑**
 
