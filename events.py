@@ -111,6 +111,9 @@ def on_transition(result, action: str, from_status: str,
         if repo.enqueue_notification(
             key, open_id, cards.card_to_content(card),
             kind="task_event", scheduled_at=current,
+            # 带上任务和版本：Worker 发出去之后要靠它把这张卡的 message_id
+            # 登记进 task_card，否则下次状态变更就刷不到这张卡
+            task_uid=task.uid, task_version=task.version,
         ):
             queued += 1
             print(f"[NOTIFY] 入队 {action} → {open_id[:12]}… key={key}")

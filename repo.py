@@ -23,7 +23,7 @@ from models_db import (
     CAND_CONFIRMED, CAND_EXPIRED, CAND_PENDING, CAND_REJECTED,
     NOTIFY_FAILED, NOTIFY_PENDING, NOTIFY_SENT, NOTIFY_SKIPPED,
     TASK_DONE, TASK_TERMINAL, TASK_TODO,
-    NotificationOutbox, Task, TaskAssignee, TaskCandidate, TaskStatusLog,
+    NotificationOutbox, Task, TaskAssignee, TaskCandidate, TaskCard, TaskStatusLog,
 )
 from schemas import TaskRecognition
 
@@ -366,6 +366,16 @@ def transition_task(task_uid: str, action: str, operator_open_id: str = "",
         # 通知失败不影响状态已经改成功这个事实，记日志就行
         print(f"[NOTIFY] 事件通知入队失败：{type(exc).__name__}: {exc}")
 
+    # 6) 旧卡片同步：把这条任务历史上发出去的卡都刷成最新状态。
+    # 回调的响应只改「被点的那一张」，其余卡片还是旧状态 ——
+    # 不刷的话，用户翻到上面那张「阻塞」卡会以为任务还卡着。
+    # 同样是后台线程：这里可能一次要改十几张卡，不能卡住回调的 3 秒预算。
+    try:
+        import card_sync
+        card_sync.sync_async(task_uid, result.task.version)
+    except Exception as exc:
+        print(f"[CARD] 卡片同步启动失败：{type(exc).__name__}: {exc}")
+
     return result
 
 
@@ -379,6 +389,107 @@ def list_task_logs(task_uid: str) -> List[TaskStatusLog]:
             .where(TaskStatusLog.task_id == task.id)
             .order_by(TaskStatusLog.id)
         ).all())
+
+
+# ---------------------------------------------------------------- 卡片登记（Day 14）
+
+# 一条任务最多维护多少张「活卡片」。
+# 为什么要有上限：一个大任务改十几次状态，历史卡片十几张，每次同步就要打
+# 十几个接口。飞书单条消息 5 QPS、接口 50 QPS，量一大就会被限流。
+# 只改最近的这些足够覆盖「用户眼前还看得到的卡」，更早的他自己也不翻了。
+MAX_LIVE_CARDS = 20
+
+
+def register_task_card(task_uid: str, message_id: str, receive_id: str,
+                       receive_id_type: str = "open_id",
+                       viewer_open_id: str = "",
+                       kind: str = "task", version: int = 0) -> bool:
+    """记下一张已发出的任务卡片。返回 True 表示新登记。
+
+    没 message_id 就别记 —— 发送失败的卡片改不动，记了只会在同步时白刷日志。
+    幂等：message_id 唯一，同一条重复登记直接忽略（重试发送时会发生）。
+    """
+    if not task_uid or not message_id:
+        return False
+
+    current = db.now()
+    with db.session_scope() as s:
+        task = s.scalar(select(Task).where(Task.uid == task_uid))
+        if task is None:
+            return False
+        stmt = (
+            sqlite_insert(TaskCard)
+            .values(
+                uid=_uid(),
+                task_id=task.id,
+                message_id=message_id,
+                receive_id=receive_id,
+                receive_id_type=receive_id_type,
+                viewer_open_id=viewer_open_id or "",
+                kind=kind,
+                synced_version=int(version or 0),
+                fail_count=0,
+                retired=0,
+                created_at=current,
+                updated_at=current,
+                synced_at=current,
+            )
+            .on_conflict_do_nothing(index_elements=["message_id"])
+        )
+        return s.execute(stmt).rowcount == 1
+
+
+def list_live_task_cards(task_uid: str, limit: int = MAX_LIVE_CARDS) -> List[TaskCard]:
+    """这条任务还没作废的卡片，最新的在前。"""
+    with db.session_scope() as s:
+        task = s.scalar(select(Task).where(Task.uid == task_uid))
+        if task is None:
+            return []
+        return list(s.scalars(
+            select(TaskCard)
+            .where(TaskCard.task_id == task.id, TaskCard.retired == 0)
+            .order_by(TaskCard.id.desc())
+            .limit(limit)
+        ).all())
+
+
+def mark_task_card_synced(message_id: str, version: int) -> None:
+    current = db.now()
+    with db.session_scope() as s:
+        s.execute(
+            update(TaskCard)
+            .where(TaskCard.message_id == message_id)
+            .values(synced_version=int(version or 0), fail_count=0,
+                    last_error=None, synced_at=current, updated_at=current)
+            .execution_options(synchronize_session=False)
+        )
+
+
+def mark_task_card_failed(message_id: str, error: str = "",
+                          max_fail: int = 3) -> None:
+    """记一次同步失败。连续失败到上限就退休，不再试。
+
+    为什么不一失败就退休：网络抖动、飞书限流都是可恢复的，下一轮再试就好。
+    但超过 14 天的消息飞书硬性不让改（错误码 230031），那种无论试多少次
+    都不会成功，靠 fail_count 自然淘汰。
+    """
+    with db.session_scope() as s:
+        row = s.scalar(select(TaskCard).where(TaskCard.message_id == message_id))
+        if row is None:
+            return
+        row.fail_count = (row.fail_count or 0) + 1
+        row.last_error = (error or "")[:200]
+        row.updated_at = db.now()
+        if row.fail_count >= max_fail:
+            row.retired = 1
+
+
+def count_task_cards() -> dict:
+    with db.session_scope() as s:
+        rows = s.execute(
+            select(TaskCard.retired, func.count()).group_by(TaskCard.retired)
+        ).all()
+    return {"retired" if flag else "live": count for flag, count in rows}
 
 
 # ---------------------------------------------------------------- 通知发件箱（Day 12）
@@ -402,7 +513,9 @@ def enqueue_notification(dedupe_key: str, receive_id: str, payload: str,
                          kind: str = "digest",
                          receive_id_type: str = "open_id",
                          msg_type: str = "interactive",
-                         scheduled_at=None) -> bool:
+                         scheduled_at=None,
+                         task_uid: Optional[str] = None,
+                         task_version: int = 0) -> bool:
     """往发件箱塞一条通知。返回 True 表示真的新建了，False 表示这条已经在队列里。
 
     【为什么用 on_conflict_do_nothing 而不是先查后插】
@@ -428,6 +541,8 @@ def enqueue_notification(dedupe_key: str, receive_id: str, payload: str,
                 receive_id_type=receive_id_type,
                 msg_type=msg_type,
                 payload=payload,
+                task_uid=task_uid,
+                task_version=int(task_version or 0),
                 status=NOTIFY_PENDING,
                 attempts=0,
                 scheduled_at=current,

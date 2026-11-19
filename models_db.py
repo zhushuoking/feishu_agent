@@ -190,6 +190,61 @@ class TaskStatusLog(Base):
     task: Mapped["Task"] = relationship(back_populates="logs")
 
 
+class TaskCard(Base):
+    """已经发出去的任务卡片登记（Day 14 补丁：旧卡片同步）。
+
+    【为什么非要有这张表】
+    飞书卡片是「发出去就定住」的静态消息。状态变了，只有「被点的那一张」
+    会跟着回调的响应变，其余历史卡片还写着旧状态。
+    后果就是用户的原话：「我解除阻塞后，任务发送方还显示任务阻塞」——
+    他翻到三天前那张红着的「阻塞」卡，以为任务还卡着。
+
+    这比不发通知更糟：发通知是为了让人知道进展，结果旧消息在撒谎。
+
+    所以每发一张任务卡就把 message_id 记下来，状态一变回头把它们全改掉。
+    卡片上 config 里的 "update_multi": true 必须保持 —— 飞书要求更新前后
+    都显式声明，否则改不动（那个字段 cards.py 里一直有）。
+
+    限制（写在代码里，免得到时踩）：
+    - 只能改 14 天内发的消息，更早的一律失败，直接标记 retired 别再试
+    - 单条消息 5 QPS，一次状态变更同步十来张卡是安全的
+    - 消息必须没被撤回、没被删除
+    """
+
+    __tablename__ = "task_card"
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_task_card_message"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    task_id: Mapped[int] = mapped_column(
+        ForeignKey("task.id", ondelete="CASCADE"), index=True
+    )
+
+    message_id: Mapped[str] = mapped_column(String(64), index=True)
+    receive_id: Mapped[str] = mapped_column(String(64), index=True)
+    receive_id_type: Mapped[str] = mapped_column(String(16), default="open_id")
+    # 空字符串 = 公共卡（发在群里，一张卡多人看）。有值 = 那个人的私聊卡。
+    # 同步时要按它重新渲染，否则会把「按张三权限裁剪的按钮」发给李四。
+    viewer_open_id: Mapped[str] = mapped_column(String(64), default="")
+
+    kind: Mapped[str] = mapped_column(String(16), default="task")  # task / event
+    # 这张卡最后一次对齐到的任务版本。同步时只改「落后于当前版本」的卡，
+    # 刚发出去的那张已经是新的，不用再打一次接口。
+    synced_version: Mapped[int] = mapped_column(Integer, default=0)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    retired: Mapped[int] = mapped_column(Integer, default=0)  # 1 = 别再改了
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+
+    created_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now)
+    updated_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now, onupdate=now)
+    synced_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+
+    def __repr__(self) -> str:
+        return f"<TaskCard {self.message_id[:12]} v{self.synced_version} ret={self.retired}>"
+
+
 # ---- 通知状态 ----
 NOTIFY_PENDING = "pending"   # 等发送
 NOTIFY_SENT = "sent"         # 已发出
@@ -223,6 +278,15 @@ class NotificationOutbox(Base):
     receive_id: Mapped[str] = mapped_column(String(64), index=True)
     receive_id_type: Mapped[str] = mapped_column(String(16), default="open_id")
     msg_type: Mapped[str] = mapped_column(String(16), default="interactive")
+
+    # 这条通知说的是哪条任务、哪个版本（Day 14 加）。
+    # 发送成功之后要靠它把这张新卡登记进 task_card —— 否则 Worker 发完
+    # 就把 message_id 丢了，那张卡从此再也不会被同步。
+    # 版本号单独存：发送那一刻 task.version 可能已经被下一个人改过了，
+    # 用「发送时的版本」登记才对得上这张卡的真实内容。
+    task_uid: Mapped[Optional[str]] = mapped_column(String(32), index=True)
+    task_version: Mapped[int] = mapped_column(Integer, default=0)
+
     # 卡片 JSON 直接存字符串：发件箱是「已渲染好的东西」，
     # 存任务 ID 再渲染一遍会导致「点开时内容和入队时不一致」
     payload: Mapped[str] = mapped_column(Text)

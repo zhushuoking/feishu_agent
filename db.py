@@ -130,13 +130,48 @@ def session_scope():
         session.close()
 
 
+def _upgrade(engine: Engine) -> None:
+    """给已经存在的表补新列。
+
+    create_all 只建不改：老库里 notify_outbox 不会有后来加的 task_uid 列，
+    直接查会报 "no such column: notify_outbox.task_uid"。
+    新表（task_card）create_all 会自己建，不用管。
+
+    SQLite 的 ADD COLUMN 是原地加、不重写表、不动数据，几毫秒的事，
+    拿来应付首期改表足够了。真上生产还是要 Alembic —— 这里只保证
+    「升级代码不会让老数据打不开」。
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "notify_outbox" not in tables:
+        return
+
+    have = {c["name"] for c in inspector.get_columns("notify_outbox")}
+    wanted = {
+        "task_uid": "VARCHAR(32)",
+        "task_version": "INTEGER DEFAULT 0",
+    }
+    missing = [(name, ddl) for name, ddl in wanted.items() if name not in have]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for name, ddl in missing:
+            conn.execute(text(f"ALTER TABLE notify_outbox ADD COLUMN {name} {ddl}"))
+            print(f"[DB] 已补列 notify_outbox.{name}")
+
+
 def init_db(db_path: Optional[str] = None) -> None:
     """建表。幂等，重复调用没有副作用。"""
     if db_path:
         configure(db_path)
     import models_db  # noqa: F401  触发 ORM 类注册到 Base.metadata
 
-    Base.metadata.create_all(get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(engine)
+    _upgrade(engine)
 
 
 def current_db_path() -> str:

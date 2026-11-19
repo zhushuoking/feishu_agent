@@ -20,7 +20,10 @@ os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 import lark_oapi as lark
 from dotenv import load_dotenv
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.im.v1 import (
+    CreateMessageRequest, CreateMessageRequestBody,
+    PatchMessageRequest, PatchMessageRequestBody,
+)
 
 load_dotenv()
 
@@ -74,6 +77,70 @@ def _send(receive_id: str, receive_id_type: str, msg_type: str,
 def send_card_to_chat(chat_id: str, card: Dict[str, Any]) -> Optional[str]:
     return _send(chat_id, "chat_id", "interactive",
                  json.dumps(card, ensure_ascii=False))
+
+
+def update_card(message_id: str, card: Dict[str, Any]) -> bool:
+    """原地更新一张已经发出去的卡片（PATCH /im/v1/messages/:message_id）。
+
+    这是「旧卡片不再撒谎」的唯一手段：回调的响应只能改被点的那一张，
+    其它历史卡片得靠这个接口回头去改。
+
+    几条硬限制（都是官方文档写死的，踩了就知道）：
+    - 只能改 14 天内发的消息，超了报 230031，重试没有意义
+    - 卡片 config 里前后都要有 "update_multi": true，否则改不动
+      （cards.py 里每张卡都带着，别删）
+    - 只能改机器人自己发的、没被撤回没被删除的消息
+    - 单条消息 5 QPS
+
+    权限：官方给的是「获取与发送单聊群组消息 / 以应用身份发消息 / 更新消息」
+    三者任一，我们已经有了前两个，**不需要额外申请**。
+    """
+    if not message_id:
+        return False
+
+    req = (
+        PatchMessageRequest.builder()
+        .message_id(message_id)
+        .request_body(
+            PatchMessageRequestBody.builder()
+            .content(json.dumps(card, ensure_ascii=False))
+            .build()
+        )
+        .build()
+    )
+    try:
+        resp = get_client().im.v1.message.patch(req)
+    except Exception as exc:
+        print(f"[CARD] 更新异常 message_id={message_id[:12]}… "
+              f"{type(exc).__name__}: {exc}")
+        return False
+
+    if not resp.success():
+        print(f"[CARD] 更新失败 message_id={message_id[:12]}… "
+              f"code={resp.code} msg={resp.msg}")
+        return False
+    return True
+
+
+def _remember_card(task, message_id: str, receive_id: str,
+                   receive_id_type: str, viewer_open_id: str = "") -> None:
+    """把发出去的卡片记进 task_card，状态变了才找得到它。
+
+    为什么在这儿做而不是让调用方做：message_id 只有发送成功的这一刻才有，
+    让上层去接返回值，等于要求每个调用点都记得记账 —— 迟早漏一个。
+    记账失败不影响发送已经成功这个事实，所以只打日志。
+    """
+    try:
+        import repo
+
+        repo.register_task_card(
+            task.uid, message_id, receive_id, receive_id_type,
+            viewer_open_id=viewer_open_id,
+            kind="task", version=int(getattr(task, "version", 0) or 0),
+        )
+    except Exception as exc:
+        print(f"[CARD] 卡片登记失败 task={getattr(task, 'uid', '?')[:8]} "
+              f"{type(exc).__name__}: {exc}")
 
 
 def send_card_to_user(open_id: str, card: Dict[str, Any]) -> Optional[str]:
@@ -135,6 +202,8 @@ def push_task_card(task, card: Optional[Dict[str, Any]] = None) -> Optional[str]
         if message_id:
             sent += 1
             print(f"[CARD] 任务卡已私聊 {open_id[:12]}… message_id={message_id}")
+            _remember_card(task, message_id, open_id, "open_id",
+                           viewer_open_id=open_id)
 
     if sent:
         return "ok"
@@ -144,4 +213,8 @@ def push_task_card(task, card: Optional[Dict[str, Any]] = None) -> Optional[str]
     # 按某个人的权限裁剪按钮会让其他人以为自己也点不了。
     # 传进来的 card 是私聊视角的，这里不能直接用。
     fallback = cards.build_task_card(task, None)
-    return send_card_to_chat(task.chat_id, fallback)
+    message_id = send_card_to_chat(task.chat_id, fallback)
+    if message_id:
+        # 群卡是公共视角，viewer 留空 —— 同步时要按这个重新渲染
+        _remember_card(task, message_id, task.chat_id, "chat_id")
+    return message_id

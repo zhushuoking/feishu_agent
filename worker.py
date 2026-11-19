@@ -49,8 +49,38 @@ def _default_sender(row) -> bool:
 
     card = json.loads(row.payload)
     if row.receive_id_type == "chat_id":
-        return feishu_api.send_card_to_chat(row.receive_id, card) is not None
-    return feishu_api.send_card_to_user(row.receive_id, card) is not None
+        message_id = feishu_api.send_card_to_chat(row.receive_id, card)
+        viewer = ""                      # 群卡是公共视角
+    else:
+        message_id = feishu_api.send_card_to_user(row.receive_id, card)
+        viewer = row.receive_id          # 私聊卡按这个人渲染
+
+    if not message_id:
+        return False
+
+    # 发出去就得记下来（Day 14）。不记的话 message_id 发完就丢了，
+    # 这张卡永远停在发送时的状态 —— 用户翻上去看到的还是「阻塞」。
+    _remember_card(row, message_id, viewer)
+    return True
+
+
+def _remember_card(row, message_id: str, viewer_open_id: str = "") -> None:
+    """把发件箱里这条通知对应的卡片登记进 task_card。
+
+    task_uid 为空的是日报，日报是「一人一份当天汇总」，没有后续状态变更，
+    不需要同步，直接跳过。
+    """
+    task_uid = getattr(row, "task_uid", "") or ""
+    if not task_uid:
+        return
+    try:
+        repo.register_task_card(
+            task_uid, message_id, row.receive_id, row.receive_id_type,
+            viewer_open_id=viewer_open_id,
+            kind=row.kind, version=int(getattr(row, "task_version", 0) or 0),
+        )
+    except Exception as exc:
+        print(f"  [WARN] 卡片登记失败 {row.dedupe_key}：{type(exc).__name__}: {exc}")
 
 
 def drain_outbox(now: Optional[datetime] = None,

@@ -11,12 +11,17 @@ from tests.helpers import save_one
 
 @pytest.fixture(autouse=True)
 def _no_event_flush(monkeypatch):
-    """测试里绝不真发消息。
+    """测试里绝不真发消息、绝不真改卡片。
 
     Day 13 之后，每次状态流转都会往发件箱塞事件通知，并且会尝试后台发送。
     测试必须把它关掉：只验「入队」这一步，发送逻辑在 Day 12 单独测过。
+
+    Day 14 之后还多了一条：状态一变会开线程去 PATCH 历史卡片。
+    同样要关 —— 单测里没有真卡片可改，真跑起来只会刷一堆失败日志。
+    同步逻辑本身用注入假 updater 的方式单独验（tests/test_card_sync.py）。
     """
     monkeypatch.setenv("EVENT_FLUSH_IMMEDIATE", "0")
+    monkeypatch.setenv("CARD_SYNC_ENABLED", "0")
 
 
 @pytest.fixture()
