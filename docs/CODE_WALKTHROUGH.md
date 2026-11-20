@@ -84,18 +84,18 @@
 | `deadline.py` | 478 | 「本周五前」→ 带时区时间 | 截止时间永远是 null |
 | `db.py` | 178 | engine / session / 时区类型 | 回调和主线程抢连接 |
 | `models_db.py` | 304 | 7 张表的 ORM | 数据没地方存 |
-| `repo.py` | 634 | **所有数据库操作的唯一入口** | 状态改得乱七八糟 |
+| `repo.py` | 659 | **所有数据库操作的唯一入口** | 状态改得乱七八糟 |
 | `cards.py` | 478 | 卡片 JSON 纯函数 | 发不出卡 |
 | `card_action.py` | 247 | 卡片按钮回调 | 点了没反应 |
 | `state_machine.py` | 166 | 状态转移表 | 能从「已完成」跳回「进行中」 |
 | `permissions.py` | 129 | 角色权限矩阵 | 谁都能验收别人的活 |
 | `feishu_api.py` | 220 | 发消息 / 改卡片封装（不抛异常） | 一次网络抖动崩掉主流程 |
-| `notify.py` | 186 | 日报生成（纯函数） | 没有每日提醒 |
-| `worker.py` | 229 | 定时投递 + 重试 | 通知发一次就丢 |
+| `notify.py` | 367 | 提醒生成（纯函数）：日报分堆、到期前 24h、逾期节流 | 没有每日提醒，也没有到期/逾期提醒 |
+| `worker.py` | 285 | 定时投递 + 重试，三类提醒统一入队 | 通知发一次就丢 |
 | `events.py` | 145 | 状态变更即时通知 | 别人动了你的任务你不知道 |
 | `card_sync.py` | 207 | 旧卡片同步（登记 message_id → 状态变了回头 PATCH） | 聊天记录里全是互相矛盾的旧状态 |
 
-**三个最大的文件**：`repo.py`(634)、`cards.py`(478)、`deadline.py`(478)，合计约占全部业务代码的四分之一。
+**三个最大的文件**：`repo.py`(659)、`cards.py`(478)、`deadline.py`(478)，合计约占全部业务代码的四分之一。
 
 ---
 
@@ -821,6 +821,7 @@ for row in rows:
 | `test_day13.py` | 14 | 提交验收通知发起人、开始处理静默、**同一次变更只入队一次**、自己人不通知自己 |
 | `test_day13b.py` | 15 | **反话和问句不能读错**、只认回复、一句话多条任务不猜 |
 | `test_card_sync.py` | 14 | 卡片登记幂等、**旧卡刷成最新**、已最新的不白刷、私聊卡不串成群卡视角、三次失败才退休 |
+| `test_reminders.py` | 18 | 到期 24h 窗口、改期后重新提醒、逾期含发起人、**2 工作日节流**、周末不催、发失败的不算数 |
 | `test_card_sync.py` | 14 | 卡片登记幂等、**旧卡刷成最新**、已最新的不白刷、私聊卡不串成群卡视角、三次失败才退休 |
 
 共用夹具：
@@ -834,7 +835,7 @@ for row in rows:
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 **202 passed**。末尾如果出现 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，
+当前 **220 passed**。末尾如果出现 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，
 那是环境的删除保护钩子在清理 pytest 临时目录，看 `N passed` 就行。
 
 ---

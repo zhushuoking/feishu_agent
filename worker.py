@@ -136,6 +136,39 @@ def drain_outbox(now: Optional[datetime] = None,
     return stats
 
 
+def _enqueue_reminders(reminders, now, dry_run: bool, label: str) -> int:
+    """把 plan_* 算出来的提醒塞进发件箱。返回真正入队的条数。
+
+    卡片在**入队这一刻**渲染好，不是发送时渲染：中间状态可能已经变了，
+    发送时再渲染会把「明天截止」改成「已完成」，人看得莫名其妙。
+    这与 Day 12 日报的做法一致。
+    """
+    queued = 0
+    for r in reminders:
+        card = cards.build_task_card(r.task, r.receive_id, hint=r.hint)
+        payload = cards.card_to_content(card)
+
+        if dry_run:
+            print(f"  [DRY ] {label} {r.receive_id[:12]}… "
+                  f"task={r.task.uid[:8]} key={r.dedupe_key}")
+            # dry-run 也要把「本来会入队几条」算进统计，
+            # 否则屏幕上打了三行 [DRY]，末尾却显示「到期提醒 0」，看着像没生效
+            queued += 1
+            continue
+
+        if repo.enqueue_notification(
+            r.dedupe_key, r.receive_id, payload,
+            kind=r.kind, scheduled_at=now,
+            # 带上任务和版本：发成功后 Worker 会把这张卡登记进 task_card，
+            # 状态一变也能跟着刷新（Day 14 的机制）
+            task_uid=r.task.uid, task_version=r.task.version,
+        ):
+            queued += 1
+            print(f"  [QUEUE] {label} {r.receive_id[:12]}… "
+                  f"task={r.task.uid[:8]} {r.dedupe_key}")
+    return queued
+
+
 def tick(now: Optional[datetime] = None, dry_run: bool = False,
          force_plan: bool = False,
          sender: Optional[Callable] = None) -> dict:
@@ -143,10 +176,15 @@ def tick(now: Optional[datetime] = None, dry_run: bool = False,
 
     sender 一路透传到 drain_outbox：测试注入假发送函数，既能验重试逻辑，
     又不会真往飞书发消息。
+
+    三类提醒的生成节奏不一样，别混：
+    - 日报：每天 9 点之后才规划（should_plan）
+    - 到期前 24h / 逾期：每轮都算，靠 dedupe_key 兜住重复，不受 9 点闸门限制
+      （「周五 10:00 截止」的任务不该等到周六才提醒）
     """
     now = now or db.now()
-    stats = {"expired": 0, "digests": 0, "enqueued": 0, "sent": 0,
-             "failed": 0, "skipped": 0, "quiet": 0}
+    stats = {"expired": 0, "digests": 0, "enqueued": 0, "due": 0, "overdue": 0,
+             "sent": 0, "failed": 0, "skipped": 0, "quiet": 0}
 
     stats["expired"] = repo.expire_candidates()
 
@@ -168,6 +206,19 @@ def tick(now: Optional[datetime] = None, dry_run: bool = False,
                 stats["enqueued"] += 1
                 print(f"  [QUEUE] 日报 {digest.open_id[:12]}… {digest.total} 条 "
                       f"{digest.dedupe_key}")
+
+    if notify.due_reminders_enabled():
+        stats["due"] = _enqueue_reminders(
+            notify.plan_due_reminders(now), now, dry_run, "到期提醒"
+        )
+
+    if notify.overdue_reminders_enabled():
+        stats["overdue"] = _enqueue_reminders(
+            notify.plan_overdue_reminders(
+                now, last_sent=repo.last_overdue_sent_times()
+            ),
+            now, dry_run, "逾期提醒",
+        )
 
     stats.update(drain_outbox(now, sender=sender, dry_run=dry_run))
     return stats
@@ -204,11 +255,15 @@ def main() -> None:
     print(f"日报时段：{notify.SEND_HOUR}:00 之后　免打扰："
           f"{notify.QUIET_START_HOUR}:00-{notify.QUIET_END_HOUR}:00　"
           f"补发上限：{notify.MAX_DELAY_HOURS} 小时")
+    print(f"到期提醒：{'开' if notify.due_reminders_enabled() else '关'}（前 24 小时）　"
+          f"逾期提醒：{'开' if notify.overdue_reminders_enabled() else '关'}"
+          f"（每 {notify.OVERDUE_INTERVAL_WORKDAYS} 个工作日）")
 
     if args.once:
         stats = tick(fixed_now, dry_run=args.dry_run, force_plan=args.force_plan)
         print(f"本轮：过期候选 {stats['expired']}　日报 {stats['digests']} 条 "
-              f"（入队 {stats['enqueued']}）　发送 {stats['sent']}　"
+              f"（入队 {stats['enqueued']}）　到期提醒 {stats['due']}　"
+              f"逾期提醒 {stats['overdue']}　发送 {stats['sent']}　"
               f"失败 {stats['failed']}　放弃 {stats['skipped']}"
               + ("　（免打扰时段，跳过发送）" if stats["quiet"] else ""))
         return
@@ -219,6 +274,7 @@ def main() -> None:
             if any(stats.values()):
                 print(f"[{db.now():%H:%M:%S}] 过期 {stats['expired']}　"
                       f"日报 {stats['digests']}　入队 {stats['enqueued']}　"
+                      f"到期 {stats['due']}　逾期 {stats['overdue']}　"
                       f"发送 {stats['sent']}　失败 {stats['failed']}")
         except Exception as exc:  # 一轮出错不能让 Worker 死掉
             print(f"[ERROR] tick 失败：{type(exc).__name__}: {exc}")

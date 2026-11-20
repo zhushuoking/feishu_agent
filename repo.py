@@ -615,6 +615,31 @@ def mark_notification_skipped(outbox_uid: str, reason: str = "") -> None:
         )
 
 
+def last_overdue_sent_times() -> dict:
+    """每条任务最近一次「成功发出」的逾期提醒时间 → {task_uid: sent_at}。
+
+    为什么要查已发送记录而不是「记一个 last_reminded_at 字段」：
+    发件箱本来就是这件事的审计日志，再存一份状态就是两个真相源，
+    迟早对不上。而且它天然只在「真发出去了」之后才算数 ——
+    入队了但被免打扰压住、或发送失败重试中的，都不该把节流计时器往前推。
+
+    status=sent 是硬条件：发失败的不能算提醒过了，否则用户永远收不到。
+    """
+    with db.session_scope() as s:
+        rows = list(s.scalars(
+            select(NotificationOutbox)
+            .where(NotificationOutbox.kind == "overdue",
+                   NotificationOutbox.status == NOTIFY_SENT,
+                   NotificationOutbox.task_uid.is_not(None))
+            .order_by(NotificationOutbox.id)
+        ).all())
+    out = {}
+    for row in rows:  # 按 id 升序，后面的覆盖前面的 = 取最新那条
+        if row.task_uid and row.sent_at:
+            out[row.task_uid] = row.sent_at
+    return out
+
+
 def list_notifications(status: Optional[str] = None,
                        limit: int = 20) -> List[NotificationOutbox]:
     stmt = select(NotificationOutbox)

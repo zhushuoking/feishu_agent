@@ -184,3 +184,184 @@ def is_too_late(scheduled_at: datetime, now: datetime,
     早上 9 点的「今天要交」，下午 5 点才发出去等于骂人。
     """
     return (now - scheduled_at) > timedelta(hours=max_delay_hours)
+
+
+# ---------------------------------------------------------------- 到期前 24h / 逾期（设计文档 12.3）
+
+# 设计文档 12.3 的「默认提醒策略」要求 9 类通知，之前只做了「每日汇总」和
+# 部分状态变更事件，这两类是缺得最明显、也最影响体验的：
+#
+# | 业务事件 | 接收人 | 通道 | 去重／限制 |
+# |---|---|---|---|
+# | 到期前 24 小时 | 主负责人 | 单聊 | 每任务每期限一次 |
+# | 逾期 | 负责人、发起人 | 单聊 | 默认首次逾期及之后每 2 个工作日一次 |
+#
+# 和日报一样走「算 / 存 / 发」三层：这两个 plan_* 只算不写不送，Worker 负责
+# 入队，drain_outbox 负责投递。理由和 Day 12 完全一样，不重复写。
+
+KIND_DUE = "due_24h"
+KIND_OVERDUE = "overdue"
+
+DUE_WINDOW_HOURS = 24
+OVERDUE_INTERVAL_WORKDAYS = int(os.getenv("OVERDUE_INTERVAL_WORKDAYS", "2"))
+
+
+def _flag(name: str) -> bool:
+    """每次调用都读环境变量，不在 import 时定死 —— 测试用 monkeypatch 关它。"""
+    return os.getenv(name, "1").strip() != "0"
+
+
+def due_reminders_enabled() -> bool:
+    return _flag("DUE_REMINDER_ENABLED")
+
+
+def overdue_reminders_enabled() -> bool:
+    return _flag("OVERDUE_REMINDER_ENABLED")
+
+
+@dataclass
+class Reminder:
+    """一条待入队的提醒。task 是已加载关系的 ORM 对象，卡片在 Worker 里渲染。"""
+
+    kind: str
+    task: Task
+    receive_id: str
+    dedupe_key: str
+    hint: str
+
+
+def _aware(dt) -> Optional[datetime]:
+    """库里读出来的理论上是 aware，防御一下 naive。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ_SHANGHAI)
+    return dt.astimezone(TZ_SHANGHAI)
+
+
+def _deadline_stamp(task) -> str:
+    dt = _aware(task.deadline_at)
+    return dt.strftime("%Y%m%d%H%M") if dt else "none"
+
+
+def due_key(task, recipient: str) -> str:
+    """设计文档 12.4 给的键：DUE_24H:{task_id}:{deadline_at}:{recipient_id}
+
+    带上 deadline_at 是关键：负责人说「延到周五」改了截止时间，那就是一个新期限，
+    应该重新提醒一次。只带 task_id 的话改期后就再也不提醒了。
+    """
+    return f"DUE_24H:{task.uid}:{_deadline_stamp(task)}:{recipient}"
+
+
+def overdue_key(task, day: str, recipient: str) -> str:
+    """文档没给逾期的键，自己定一个。
+
+    带日期而不是「第几次」：同一天 Worker 跑 60 轮也只会有一条（唯一约束），
+    换一天才可能再发，配合 2 工作日节流正好。
+    """
+    return f"OVERDUE:{task.uid}:{day}:{recipient}"
+
+
+def is_workday(day) -> bool:
+    """周一到周五。
+
+    【坑】这里没接法定节假日表。国庆调休、春节这种日子会照常发提醒，
+    首期先忍着。真要接，得维护一张 holiday 表或一个可配置的 JSON，
+    别在代码里硬编码 2026 年的节假日 —— 明年就错了。
+    """
+    return day.weekday() < 5
+
+
+def workdays_between(start, end) -> int:
+    """(start, end] 之间的工作日天数，左开右闭。"""
+    if end <= start:
+        return 0
+    count, cur = 0, start
+    while cur < end:
+        cur += timedelta(days=1)
+        if is_workday(cur):
+            count += 1
+    return count
+
+
+def should_remind_overdue(now: datetime, last_sent=None,
+                          interval_workdays: Optional[int] = None) -> bool:
+    """这次 tick 要不要给这条任务发逾期提醒。
+
+    首次（从没发过）→ 发。之后要求「距上次发出跨过 N 个工作日」。
+    非工作日直接不发：周末催人只会让人把机器人的通知关掉。
+    """
+    interval = OVERDUE_INTERVAL_WORKDAYS if interval_workdays is None else interval_workdays
+    today = now.astimezone(TZ_SHANGHAI).date()
+    if not is_workday(today):
+        return False
+    if last_sent is None:
+        return True
+    last_day = _aware(last_sent).date()
+    return workdays_between(last_day, today) >= interval
+
+
+def _recipients(task, include_creator: bool) -> List[str]:
+    ids = list(task.owner_open_ids)
+    if include_creator:
+        ids.append(task.creator_open_id)
+    return [x for x in dict.fromkeys(ids) if x]
+
+
+def plan_due_reminders(now: Optional[datetime] = None,
+                       horizon_hours: int = DUE_WINDOW_HOURS) -> List[Reminder]:
+    """算「到期前 24 小时」该发给谁。纯函数，now 可注入。
+
+    窗口是 (now, now+24h]，不含已经过点的任务 —— 那些归逾期提醒管，
+    两边都发就成了一条任务连收两条，噪音。
+    """
+    now = now or db.now()
+    upper = now + timedelta(hours=horizon_hours)
+    out: List[Reminder] = []
+
+    for task in repo.list_active_tasks_with_deadline():
+        deadline = _aware(task.deadline_at)
+        if deadline is None or not (now < deadline <= upper):
+            continue
+
+        hours_left = max(0, int((deadline - now).total_seconds() // 3600))
+        clock = deadline.strftime("%m-%d %H:%M")
+        left = (f"还有 {hours_left} 小时" if hours_left else "马上就到")
+        hint = f"距离截止{left}（{clock}），记得收尾"
+
+        for open_id in _recipients(task, include_creator=False):
+            out.append(Reminder(KIND_DUE, task, open_id,
+                                due_key(task, open_id), hint))
+    return out
+
+
+def plan_overdue_reminders(now: Optional[datetime] = None,
+                           last_sent: Optional[Dict[str, datetime]] = None,
+                           interval_workdays: Optional[int] = None) -> List[Reminder]:
+    """算「逾期」该发给谁。纯函数：上次发送时间由调用方传进来。
+
+    为什么 last_sent 不由这里查库：查了库就不纯了，单测得先造一堆发件箱记录
+    才能验「2 个工作日节流」。现在传一个 dict 就能测，边界清清楚楚。
+    """
+    now = now or db.now()
+    today = now.astimezone(TZ_SHANGHAI)
+    if not is_workday(today.date()):
+        return []
+    day_str = today.strftime("%Y-%m-%d")
+    last_sent = last_sent or {}
+    out: List[Reminder] = []
+
+    for task in repo.list_active_tasks_with_deadline():
+        deadline = _aware(task.deadline_at)
+        if deadline is None or deadline >= now:
+            continue
+        if not should_remind_overdue(now, last_sent.get(task.uid), interval_workdays):
+            continue
+
+        days = max(0, (now - deadline).days)
+        hint = (f"任务已逾期 {days} 天（截止 {deadline:%m-%d %H:%M}），"
+                f"请尽快处理，或回复说明情况")
+        for open_id in _recipients(task, include_creator=True):
+            out.append(Reminder(KIND_OVERDUE, task, open_id,
+                                overdue_key(task, day_str, open_id), hint))
+    return out

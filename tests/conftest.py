@@ -19,9 +19,16 @@ def _no_event_flush(monkeypatch):
     Day 14 之后还多了一条：状态一变会开线程去 PATCH 历史卡片。
     同样要关 —— 单测里没有真卡片可改，真跑起来只会刷一堆失败日志。
     同步逻辑本身用注入假 updater 的方式单独验（tests/test_card_sync.py）。
+
+    Day 15 之后又加了两类定时提醒。也默认关掉：老测试把「现在」写死在
+    2026-11-17 09:05，很多任务的截止时间恰好落在到期前 24 小时窗口里，
+    一开会多出几条通知，把「同一天只入队一条」这类断言全冲掉。
+    新提醒在 tests/test_reminders.py 里单独打开来验。
     """
     monkeypatch.setenv("EVENT_FLUSH_IMMEDIATE", "0")
     monkeypatch.setenv("CARD_SYNC_ENABLED", "0")
+    monkeypatch.setenv("DUE_REMINDER_ENABLED", "0")
+    monkeypatch.setenv("OVERDUE_REMINDER_ENABLED", "0")
 
 
 @pytest.fixture()
