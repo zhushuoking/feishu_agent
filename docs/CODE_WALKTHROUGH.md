@@ -83,7 +83,9 @@
 | `detector.py` | 93 | 编排：提示词→模型→校验→防幻觉→时间 | 没有识别能力 |
 | `deadline.py` | 478 | 「本周五前」→ 带时区时间 | 截止时间永远是 null |
 | `db.py` | 178 | engine / session / 时区类型 | 回调和主线程抢连接 |
-| `models_db.py` | 304 | 7 张表的 ORM | 数据没地方存 |
+| `models_db.py` | — | 8 张表的 ORM | 数据没地方存 |
+| `calendar_api.py` | — | 飞书日历 v4 REST 封装（不抛异常） | 日历挂了拖垮建单 |
+| `calendar_sync.py` | — | 任务 ↔ 日程同步编排 + 诊断 CLI | 不知道该 PATCH / DELETE 哪个日程 |
 | `repo.py` | 659 | **所有数据库操作的唯一入口** | 状态改得乱七八糟 |
 | `cards.py` | 478 | 卡片 JSON 纯函数 | 发不出卡 |
 | `card_action.py` | 247 | 卡片按钮回调 | 点了没反应 |
@@ -683,7 +685,7 @@ for row in rows:
 
 ## 数据库表
 
-一共 7 张表，其中 `event_inbox` 由 `store.py` 用原生 sqlite3 管理，其余 6 张走 SQLAlchemy。
+一共 8 张表，其中 `event_inbox` 由 `store.py` 用原生 sqlite3 管理，其余 7 张走 SQLAlchemy。
 
 ### `event_inbox`（去重）
 
@@ -773,6 +775,21 @@ for row in rows:
 这张表存在的唯一目的：**让旧卡片不再显示过时状态**。为什么非要这张表，
 见下面第 11 条决策。
 
+### `task_calendar_event`（任务 ↔ 日程，Day 16）
+
+| 字段 | 说明 |
+|---|---|
+| `task_uid` | **唯一约束**，一条任务最多一个日程，重复点确认不建第二个 |
+| `calendar_id` + `event_id` | 验收时该 PATCH 谁、取消时该 DELETE 谁，全靠它俩 |
+| `idempotency_key` | 固定 40 字符，重试复用；「接口成功但崩在写库前」也不会重复建 |
+| `deadline_at` | **建日程那一刻**的截止，和 `task.deadline_at` 一比就知道改没改期 |
+| `attendees_synced` | 参与人加成功才置 1，避免重试时反复加同一批人 |
+| `status` | pending / created / deleted / failed / skipped |
+
+一个容易写错的设计：PATCH / DELETE 失败时**只记 `last_error`，状态保持
+`created`**。如果标成 `failed`，下一次重试会被 `status != CAL_CREATED` 挡住，
+那个日程就永远删不掉了。只有「创建都没成功」才配标 `failed`。
+
 ---
 
 ## 十一个关键设计决策
@@ -822,7 +839,7 @@ for row in rows:
 | `test_day13b.py` | 15 | **反话和问句不能读错**、只认回复、一句话多条任务不猜 |
 | `test_card_sync.py` | 14 | 卡片登记幂等、**旧卡刷成最新**、已最新的不白刷、私聊卡不串成群卡视角、三次失败才退休 |
 | `test_reminders.py` | 18 | 到期 24h 窗口、改期后重新提醒、逾期含发起人、**2 工作日节流**、周末不催、发失败的不算数 |
-| `test_card_sync.py` | 14 | 卡片登记幂等、**旧卡刷成最新**、已最新的不白刷、私聊卡不串成群卡视角、三次失败才退休 |
+| `test_calendar_sync.py` | 26 | 15 分钟占用窗口、秒级字符串时间戳、幂等 key 重试复用、加参与人去重、accept/cancel 分流、删失败可重试 |
 
 共用夹具：
 
@@ -835,7 +852,7 @@ for row in rows:
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-当前 **220 passed**。末尾如果出现 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，
+当前 **415 passed**。末尾如果出现 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]`，
 那是环境的删除保护钩子在清理 pytest 临时目录，看 `N passed` 就行。
 
 ---

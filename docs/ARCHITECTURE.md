@@ -187,10 +187,34 @@ Day 12 只解决了「到点了提醒你」。还差两件事：**别人动了�
 | `tests/test_day13b.py`（15 条） | 一句话读成动作、**反话与问句不能读错**、只认回复、陌生人无权限、状态不对要说清楚、已结束不再改、一句话多条任务不猜、反馈改状态也走通知 |
 | `tests/test_card_sync.py`（14 条） | 卡片登记幂等、旧卡刷成最新状态、已最新的不白刷、**私聊卡不串成群卡视角**、失败可重试、三次失败才退休 |
 | `tests/test_reminders.py`（18 条） | 到期窗口 24h、改期后能重新提醒、**逾期收件人含发起人**、2 工作日节流、周末不催、发失败的不算提醒过、同一天不重复 |
+| `tests/test_calendar_sync.py`（26 条） | 15 分钟占用窗口、秒级字符串时间戳、**提醒相对开始时间**、幂等 key 重试复用、加参与人去重、accept/cancel 分流、删失败可重试 |
 
-跑法：`.venv\Scripts\python.exe -m pytest -q`（当前 220 passed）
+跑法：`.venv\Scripts\python.exe -m pytest -q`（当前 415 passed）
 
 > 本机跑 pytest 末尾会出现 `[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]` 的报错，那是环境的删除保护钩子在清理 pytest 临时目录时的噪音，不影响测试结果（看 `N passed` 即可）。
+
+## 五之二、日历层（Day 16）
+
+| 文件 | 职责 |
+|---|---|
+| `calendar_api.py` | 飞书日历 v4 的 REST 薄封装（httpx）：取 token、查主日历、建/改/删日程、加参与人。**不抛异常**，失败返回 None/False |
+| `calendar_sync.py` | 业务编排：`build_event_body` 纯函数渲染日程、`sync_created` / `sync_transition` / `sync_deadline_changed`，以及后台线程入口和诊断 CLI |
+| `models_db.TaskCalendarEvent` | `task_calendar_event` 表：存 `task_uid` / `calendar_id` / `event_id` / `idempotency_key` / 建日程时的截止时间 |
+
+挂点只有两个：`card_action._process_candidate()` 确认建单成功后调
+`on_created_async()`；`repo.transition_task()` 末尾调 `on_transition_async()`
+（只认 `accept` / `cancel`）。
+
+三个容易写错的地方：
+- **`timestamp` 是秒级字符串**，飞书 v4 的 `time_info` 对象，不是毫秒/整数
+- **`reminders[].minutes` 相对日程开始时间**，不是相对截止时间。开始已经是
+  `deadline - 15min`，所以要设 `0` 才落在截止前 15 分钟
+- **PATCH 改时间必须 `start_time` + `end_time` 同时传**，只传一个会被忽略
+
+幂等是两层：库里 `task_uid` 唯一约束挡住重复确认；固定的
+`idempotency_key` 让「接口成功但进程崩在写库之前」的重试不会建出第二个日程。
+创建/更新/删除失败只记 `last_error` 并保留 `created` 状态，否则后续重试会被
+`status != CAL_CREATED` 永远挡住。
 
 ## 六、还没写的部分（对照设计文档）
 
