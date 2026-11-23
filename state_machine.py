@@ -7,9 +7,8 @@
 - DONE 再回 IN_PROGRESS —— 已完成的任务被悄悄复活，统计和对账全乱
 - CANCELLED 复活 —— 取消是一种承诺，不能靠改状态撤销
 
-首期故意做严：TODO 必须先 IN_PROGRESS 才能往下走。
-觉得麻烦是因为「小任务一句话就完了」，但那种情况本来就该换个说法
-（直接说"已经做完了"由反馈分类处理），而不是把状态机放开。
+设计 §6.3 允许待开始、进行中和阻塞任务提交验收。
+待验收时补充完成说明只更新原任务与验收卡。
 
 和设计的对应关系：
   7.2 状态定义与流转
@@ -21,22 +20,24 @@ from typing import Dict, FrozenSet, List
 
 from models_db import (
     TASK_BLOCKED, TASK_CANCELLED, TASK_DONE, TASK_IN_PROGRESS,
-    TASK_PENDING_ACCEPTANCE, TASK_STATUSES, TASK_TERMINAL, TASK_TODO,
+    TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE, TASK_STATUSES, TASK_TERMINAL, TASK_TODO,
 )
 
 # 合法的状态转移表。想加转移就改这里，别在业务代码里写 if 判断。
 TRANSITIONS: Dict[str, FrozenSet[str]] = {
-    TASK_TODO: frozenset({TASK_IN_PROGRESS, TASK_CANCELLED}),
+    TASK_NEEDS_INFO: frozenset({TASK_TODO, TASK_CANCELLED}),
+    TASK_TODO: frozenset({TASK_IN_PROGRESS, TASK_BLOCKED, TASK_PENDING_ACCEPTANCE, TASK_CANCELLED}),
     TASK_IN_PROGRESS: frozenset({TASK_BLOCKED, TASK_PENDING_ACCEPTANCE, TASK_CANCELLED}),
-    TASK_BLOCKED: frozenset({TASK_IN_PROGRESS, TASK_CANCELLED}),
+    TASK_BLOCKED: frozenset({TASK_IN_PROGRESS, TASK_PENDING_ACCEPTANCE, TASK_CANCELLED}),
     # 验收不通过 → 打回继续做
-    TASK_PENDING_ACCEPTANCE: frozenset({TASK_DONE, TASK_IN_PROGRESS, TASK_CANCELLED}),
+    TASK_PENDING_ACCEPTANCE: frozenset({TASK_DONE, TASK_IN_PROGRESS, TASK_CANCELLED, TASK_PENDING_ACCEPTANCE}),
     TASK_DONE: frozenset(),
     TASK_CANCELLED: frozenset(),
 }
 
 # 状态的中文名，卡片和 CLI 都用它，别在三个地方各写一份
 STATUS_LABELS = {
+    TASK_NEEDS_INFO: "待补充",
     TASK_TODO: "待开始",
     TASK_IN_PROGRESS: "进行中",
     TASK_BLOCKED: "阻塞",
@@ -49,10 +50,16 @@ STATUS_LABELS = {
 # 同样是去 IN_PROGRESS，"开始处理""解除阻塞""验收打回"是三种不同语义。
 # 所以这里用 (原状态, 目标状态) 反查动作名，而不是动作直接映射状态。
 _ACTION_OF: Dict[tuple, str] = {
+    (TASK_NEEDS_INFO, TASK_TODO): "supplement",
+    (TASK_NEEDS_INFO, TASK_CANCELLED): "cancel",
     (TASK_TODO, TASK_IN_PROGRESS): "start",
     (TASK_IN_PROGRESS, TASK_BLOCKED): "block",
+    (TASK_TODO, TASK_BLOCKED): "block",
     (TASK_BLOCKED, TASK_IN_PROGRESS): "unblock",
     (TASK_IN_PROGRESS, TASK_PENDING_ACCEPTANCE): "submit",
+    (TASK_TODO, TASK_PENDING_ACCEPTANCE): "submit",
+    (TASK_BLOCKED, TASK_PENDING_ACCEPTANCE): "submit",
+    (TASK_PENDING_ACCEPTANCE, TASK_PENDING_ACCEPTANCE): "submit",
     (TASK_PENDING_ACCEPTANCE, TASK_DONE): "accept",
     (TASK_PENDING_ACCEPTANCE, TASK_IN_PROGRESS): "reject",
     (TASK_TODO, TASK_CANCELLED): "cancel",
@@ -62,6 +69,7 @@ _ACTION_OF: Dict[tuple, str] = {
 }
 
 ACTION_LABELS = {
+    "supplement": "补充信息",
     "start": "开始处理",
     "block": "报阻塞",
     "unblock": "解除阻塞",
@@ -149,8 +157,8 @@ def resolve_action(from_status: str, action: str):
 
 def next_actions(current_status: str) -> List[str]:
     """当前状态下状态层面可行的动作，按固定顺序返回，方便卡片按顺序出按钮。"""
-    order = ["start", "block", "unblock", "submit", "accept", "reject", "cancel"]
-    hits = [name for (src, _dst), name in _ACTION_OF.items() if src == current_status]
+    order = ["supplement", "start", "block", "unblock", "submit", "accept", "reject", "cancel"]
+    hits = [name for (src, dst), name in _ACTION_OF.items() if src == current_status and src != dst]
     return [a for a in order if a in hits]
 
 

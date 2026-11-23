@@ -8,8 +8,8 @@
     .venv\\Scripts\\python.exe taskctl.py start 0293 --as ou_xxx
     .venv\\Scripts\\python.exe taskctl.py accept 0293 --as ou_xxx --note "验收通过"
 
-不传 --as 时，依次取：环境变量 AGENT_DEFAULT_OPERATOR → 任务第一个负责人。
-输出里会写明「以谁的身份执行」，别看着成功了却不知道是谁的成功。
+执行动作需设置 FEISHU_USER_ACCESS_TOKEN，由飞书验证当前身份。
+--as 若提供，必须与验证身份一致。查看命令可按角色预览按钮。
 """
 
 import argparse
@@ -105,22 +105,36 @@ def cmd_show(prefix: str, given_operator: str) -> None:
 
 
 def cmd_action(action: str, prefix: str, given_operator: str, note: str,
-               notify: bool = True) -> None:
+               notify: bool = True, deliverable=None, deadline_text=None) -> None:
     task, err = _find(prefix)
     if task is None:
         print(err)
         sys.exit(1)
 
-    operator = _operator(task, given_operator)
-    if not operator:
-        print("没指定操作人，用 --as ou_xxx 指定")
-        sys.exit(1)
+    from show_db import _verified_operator
+
+    try:
+        operator = _verified_operator()
+    except ValueError as exc:
+        sys.exit(str(exc))
+    if given_operator and given_operator != operator:
+        sys.exit("指定账号与飞书验证身份不一致")
 
     print(f"以 {operator}（{permissions.describe_roles(task, operator)}）的身份"
           f"对 [{task.uid[:8]}] 执行「{state_machine.ACTION_LABELS.get(action, action)}」")
 
-    result = repo.transition_task(task.uid, action, operator_open_id=operator,
-                                  note=note or None)
+    if action == "supplement":
+        import deadline
+        parsed = deadline.parse_deadline(deadline_text, db.now()) if deadline_text else None
+        if parsed and not parsed.ok:
+            sys.exit("截止时间无法解析，请提供明确的日期和时间")
+        result = repo.supplement_task(task.uid, operator, deliverable=deliverable,
+                                     deadline_at=parsed.deadline_at if parsed else None,
+                                     deadline_text=deadline_text, expected_version=task.version,
+                                     note=note or "命令行人工补充任务信息")
+    else:
+        result = repo.transition_task(task.uid, action, operator_open_id=operator,
+                                      note=note or None)
     if result.ok:
         print(f"成功：{result.message}  现在 v{result.task.version}")
         if notify:
@@ -147,11 +161,14 @@ def main() -> None:
     p_show.add_argument("prefix")
     p_show.add_argument("--as", dest="operator", default="")
 
-    for name in ("start", "block", "unblock", "submit", "accept", "reject", "cancel"):
+    for name in ("supplement", "start", "block", "unblock", "submit", "accept", "reject", "cancel"):
         p = sub.add_parser(name, help=state_machine.ACTION_LABELS[name])
         p.add_argument("prefix")
         p.add_argument("--as", dest="operator", default="")
         p.add_argument("--note", default="")
+        if name == "supplement":
+            p.add_argument("--deliverable")
+            p.add_argument("--deadline")
         p.add_argument("--no-notify", action="store_true",
                        help="只改状态，不发通知（调试用）")
 
@@ -164,7 +181,8 @@ def main() -> None:
         cmd_show(args.prefix, args.operator)
     elif args.cmd in state_machine.ACTION_LABELS:
         cmd_action(args.cmd, args.prefix, args.operator, args.note,
-                   notify=not getattr(args, "no_notify", False))
+                   notify=not getattr(args, "no_notify", False),
+                   deliverable=getattr(args, "deliverable", None), deadline_text=getattr(args, "deadline", None))
     else:
         parser.print_help()
 

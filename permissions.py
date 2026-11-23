@@ -1,18 +1,4 @@
-"""Day 10：权限校验（对应设计文档 7.3）。
-
-三个角色，按「谁跟这个任务有关系」判定，不做组织架构：
-  owner   —— 负责人，负责干活和报进展
-  creator —— 发起人，负责验收和取消
-  admin   —— 管理员，兜底处理所有人搞不定的情况
-
-为什么不用部门/岗位那套：
-首期没有组织架构数据，硬接通讯录要额外权限和一堆同步逻辑。
-用 open_id 比对能覆盖 95% 的场景，剩下 5% 交给 admin 名单。
-
-一个刻意的兜底：任务没有负责人时，发起人可以代行负责人动作。
-否则「识别时没 @ 到人」的任务会永远停在待开始，谁也没法推进。
-这条规则宁可宽松，也不能让任务死在那儿。
-"""
+"""按任务参与关系和群项目经理授权校验业务操作。"""
 
 import os
 from dataclasses import dataclass
@@ -23,22 +9,63 @@ from state_machine import ACTION_LABELS
 ROLE_OWNER = "owner"
 ROLE_CREATOR = "creator"
 ROLE_ADMIN = "admin"
+ROLE_MANAGER = "manager"
+ROLE_REVIEWER = "reviewer"
 
 ROLE_LABELS = {
     ROLE_OWNER: "负责人",
     ROLE_CREATOR: "发起人",
     ROLE_ADMIN: "管理员",
+    ROLE_MANAGER: "项目经理",
+    ROLE_REVIEWER: "验收人",
 }
+
+
+def enabled_chat_ids() -> Set[str]:
+    def configured(name: str) -> set[str]:
+        return {value.strip() for value in os.getenv(name, "").split(",") if value.strip()}
+
+    return configured("FEISHU_ALLOWED_CHAT_IDS") - configured("FEISHU_DISABLED_CHAT_IDS")
+
+
+def chat_enabled(chat_id: str) -> bool:
+    return chat_id in enabled_chat_ids()
+
+
+def may_handle_candidate(candidate, operator_open_id: str) -> bool:
+    if not operator_open_id or not chat_enabled(candidate.chat_id):
+        return False
+    if candidate.sender_open_id == operator_open_id:
+        return True
+    # 每项只授予一个群内的候选审批权。系统管理员角色不参与此判断。
+    return operator_open_id in chat_managers(candidate.chat_id)
+
+
+def chat_managers(chat_id: str) -> Set[str]:
+    return {
+        user_id for binding in os.getenv("FEISHU_CHAT_MANAGER_BINDINGS", "").split(",")
+        for group, separator, user_id in [binding.strip().partition(":")]
+        if separator and group == chat_id and user_id
+    }
+
+
+def default_reviewer(chat_id: str) -> str:
+    for binding in os.getenv("FEISHU_CHAT_REVIEWER_BINDINGS", "").split(","):
+        group, separator, user_id = binding.strip().partition(":")
+        if separator and group == chat_id:
+            return user_id
+    return ""
 
 # 动作 → 允许的角色。收紧权限就改这里。
 ACTION_ROLES = {
-    "start": {ROLE_OWNER, ROLE_ADMIN},
-    "block": {ROLE_OWNER, ROLE_ADMIN},
-    "unblock": {ROLE_OWNER, ROLE_ADMIN},
-    "submit": {ROLE_OWNER, ROLE_ADMIN},
-    "accept": {ROLE_CREATOR, ROLE_ADMIN},
-    "reject": {ROLE_CREATOR, ROLE_ADMIN},
-    "cancel": {ROLE_CREATOR, ROLE_ADMIN},
+    "supplement": {ROLE_OWNER, ROLE_CREATOR, ROLE_REVIEWER, ROLE_MANAGER},
+    "start": {ROLE_OWNER},
+    "block": {ROLE_OWNER},
+    "unblock": {ROLE_OWNER, ROLE_CREATOR, ROLE_MANAGER},
+    "submit": {ROLE_OWNER, ROLE_MANAGER},
+    "accept": {ROLE_CREATOR, ROLE_REVIEWER, ROLE_MANAGER},
+    "reject": {ROLE_CREATOR, ROLE_REVIEWER, ROLE_MANAGER},
+    "cancel": {ROLE_CREATOR, ROLE_MANAGER},
 }
 
 
@@ -59,6 +86,10 @@ def roles_of(task, open_id: str) -> Set[str]:
         roles.add(ROLE_CREATOR)
     if open_id in set(task.owner_open_ids):
         roles.add(ROLE_OWNER)
+    if open_id in chat_managers(task.chat_id):
+        roles.add(ROLE_MANAGER)
+    if open_id == task.effective_reviewer_open_id:
+        roles.add(ROLE_REVIEWER)
     return roles
 
 
@@ -66,7 +97,7 @@ def describe_roles(task, open_id: str) -> str:
     roles = roles_of(task, open_id)
     if not roles:
         return "与该任务无关"
-    order = [ROLE_CREATOR, ROLE_OWNER, ROLE_ADMIN]
+    order = [ROLE_CREATOR, ROLE_OWNER, ROLE_REVIEWER, ROLE_MANAGER, ROLE_ADMIN]
     return "、".join(ROLE_LABELS[r] for r in order if r in roles)
 
 
@@ -89,31 +120,16 @@ def can(task, open_id: str, action: str) -> Permission:
         return Permission(False, f"未知动作：{action}")
 
     roles = roles_of(task, open_id)
+    if action in ("accept", "reject") and ROLE_OWNER in roles:
+        return Permission(False, "负责人不能自行验收，请由其他发起人、验收人或项目经理处理")
 
-    # 先按正常矩阵判。有权限就直接过，别让兜底规则盖住正常判定。
     if roles & allowed_roles:
-        # 一个小团队的现实问题：发起人常常就是负责人（自己 @ 自己布置活）。
-        # 这种情况硬挡「不能自己验收自己」会让任务永远完不成，
-        # 所以放行，但把「自验收」写进拒绝不得的地方 —— 返回值里带上原因，
-        # 流水里就会留痕，事后复盘能一眼看出这条是自验收的。
-        if {ROLE_OWNER, ROLE_CREATOR} <= roles and action in ("accept", "reject"):
-            return Permission(True, "发起人同时也是负责人：自验收")
         return Permission(True)
-
-    # 兜底：任务压根没有负责人时，发起人可以代行负责人的动作。
-    # 注意这里不能写成「if not roles」—— 发起人自己一定有 creator 角色，
-    # roles 永远非空，那样写兜底等于永远不生效（踩过）。
-    # 只对「本该由负责人做的动作」开口子：验收/取消发起人本来就能做，
-    # 走不到这里，不需要兜底。
-    if (ROLE_OWNER in allowed_roles
-            and not task.owner_open_ids
-            and open_id == task.creator_open_id):
-        return Permission(True, "任务没有负责人，发起人代行")
 
     if not roles:
         return Permission(
             False,
-            f"你不是这个任务的负责人或发起人，不能「{ACTION_LABELS.get(action, action)}」",
+            f"当前账号无权「{ACTION_LABELS.get(action, action)}」",
         )
 
     needed = "、".join(ROLE_LABELS[r] for r in sorted(allowed_roles))

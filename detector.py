@@ -4,6 +4,7 @@
 设计文档 4.4 明确：大模型模块只返回结构化候选，不直接写库、不直接发飞书消息。
 """
 
+import re
 from typing import List, Optional
 
 import deadline
@@ -63,11 +64,32 @@ def detect(cmd: MessageCommand) -> TaskRecognition:
         raise DetectionError(f"模型输出未通过 Schema 校验：{exc}") from exc
 
     result = _validate_mentions(result, cmd.mentions)
+    _validate_priority(result, cmd.text)
 
     # 时间换算放在模型之后、业务之前：模型只抄原文，日期由确定性代码算。
     # 基准是消息的 sent_at，不是 now()。
     deadline.apply_to_tasks(result.tasks, cmd.sent_at)
     return result
+
+
+def _validate_priority(result: TaskRecognition, source: str) -> None:
+    """紧急优先级必须有当前消息中可核验的肯定要求。"""
+    for task in result.tasks:
+        evidence = (task.priority_evidence or "").strip()
+        match = re.search(
+            r"紧急任务|紧急事项|十万火急|(?:紧急|加急)[，,：:\s]*(?:请|处理|提交|完成|交付|办理)"
+            r"|(?:请|务必|需要|要求)[^。！？!?；;\n]{0,12}(?:加急|紧急)"
+            r"|优先(?:处理|完成|提交)|(?:立即|马上)(?:处理|提交|完成)",
+            evidence,
+        )
+        negated = re.search(
+            r"(?:不|非|无需|不用|无须|不必|取消|别|勿)[^，,。！？!?；;\n]{0,6}"
+            r"(?:紧急|加急|优先|立即|马上)", evidence,
+        )
+        if (task.priority != "urgent" or not evidence or evidence not in source
+                or evidence not in task.evidence or not match or negated):
+            task.priority = "normal"
+            task.priority_evidence = None
 
 
 def detect_text(text: str, *, mentions: Optional[List[Mention]] = None,

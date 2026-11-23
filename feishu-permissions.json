@@ -9,6 +9,12 @@
       "im:message.group_msg",
       "im:message:send_as_bot",
       "im:resource"
+    ],
+    "user": [
+      "auth:user.id:read",
+      "calendar:calendar",
+      "calendar:calendar:readonly",
+      "offline_access"
     ]
   }
 }

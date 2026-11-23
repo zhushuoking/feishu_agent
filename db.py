@@ -145,6 +145,32 @@ def _upgrade(engine: Engine) -> None:
 
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
+    if "task" in tables and "completion_note" not in {
+        column["name"] for column in inspector.get_columns("task")
+    }:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task ADD COLUMN completion_note TEXT"))
+    if "task" in tables and "review_note" not in {
+        column["name"] for column in inspector.get_columns("task")
+    }:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task ADD COLUMN review_note TEXT"))
+    if "task_calendar_event" in tables:
+        have_calendar = {c["name"] for c in inspector.get_columns("task_calendar_event")}
+        with engine.begin() as conn:
+            for name, ddl in {
+                "synced_version": "INTEGER NOT NULL DEFAULT 0",
+                "retry_at": "VARCHAR",
+                "request_body": "TEXT",
+                "sync_mode": "VARCHAR(16) NOT NULL DEFAULT 'application'",
+            }.items():
+                if name not in have_calendar:
+                    conn.execute(text(f"ALTER TABLE task_calendar_event ADD COLUMN {name} {ddl}"))
+    if "task" in tables and "reviewer_open_id" not in {
+        column["name"] for column in inspector.get_columns("task")
+    }:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task ADD COLUMN reviewer_open_id VARCHAR(64)"))
     if "notify_outbox" not in tables:
         return
 
@@ -172,6 +198,30 @@ def init_db(db_path: Optional[str] = None) -> None:
     engine = get_engine()
     Base.metadata.create_all(engine)
     _upgrade(engine)
+    _backfill_information_status()
+
+
+def _backfill_information_status() -> None:
+    """历史待开始任务缺字段时隔离到待补充，版本及流水同时更新。"""
+    from sqlalchemy import func, or_, select, update
+    from models_db import Task, TaskAssignee, TaskStatusLog, TASK_NEEDS_INFO, TASK_TODO
+
+    with session_scope() as session:
+        rows = list(session.scalars(select(Task).where(
+            Task.status == TASK_TODO,
+            or_(Task.deadline_at.is_(None), func.trim(func.coalesce(Task.deliverable, "")) == "",
+                ~Task.assignees.any(TaskAssignee.role == "owner")),
+        )).all())
+        for task in rows:
+            changed = session.execute(update(Task).where(
+                Task.id == task.id, Task.status == TASK_TODO, Task.version == task.version,
+            ).values(status=TASK_NEEDS_INFO, version=Task.version + 1, updated_at=now())
+                .execution_options(synchronize_session=False))
+            if changed.rowcount:
+                session.add(TaskStatusLog(task_id=task.id, from_status=TASK_TODO,
+                                          to_status=TASK_NEEDS_INFO, operator_open_id=None,
+                                          reason="历史任务字段校验：待补充" + "、".join(task.missing_info),
+                                          created_at=now()))
 
 
 def current_db_path() -> str:

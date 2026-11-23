@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 
 import cards
 import events
+import permissions
 import repo
 from models_db import CAND_CONFIRMED, CAND_EXPIRED, CAND_REJECTED
 
@@ -38,13 +39,13 @@ class Outcome:
 
     toast_type: str          # success / error / warning / info
     toast_content: str
-    card: Dict[str, Any]
+    card: Optional[Dict[str, Any]]
     ok: bool = True
 
 
 def process(action: str, cid: str = "", operator_open_id: str = "",
             tid: str = "", ver: Optional[int] = None,
-            pub: bool = False) -> Outcome:
+            pub: bool = False, message_id: str = "") -> Outcome:
     """执行按钮动作。
 
     cid = 候选 uid（确认/忽略），tid = 任务 uid（状态流转）。
@@ -57,6 +58,16 @@ def process(action: str, cid: str = "", operator_open_id: str = "",
     if tid:
         return _process_task(action, tid, operator_open_id, ver, pub)
 
+    try:
+        return _process_candidate(action, cid, operator_open_id, message_id)
+    except repo.CandidateActionError as exc:
+        # 只给点击者提示，授权人仍可使用原卡。
+        print(f"[CARD] 候选操作拒绝 cid={cid[:8]} operator={operator_open_id[:12]} 原因={exc}")
+        return Outcome("warning", str(exc), None, ok=False)
+
+
+def _process_candidate(action: str, cid: str, operator_open_id: str,
+                       message_id: str = "") -> Outcome:
     if not cid:
         return Outcome(
             "error", "卡片数据不完整，请联系管理员",
@@ -85,12 +96,27 @@ def process(action: str, cid: str = "", operator_open_id: str = "",
             )
         print(f"[CARD] 确认建单 candidate={cid[:8]} task={task.uid[:8]} "
               f"operator={operator_open_id[:12]}")
+        # 回调替换的确认卡也会被发起人继续查看，必须参与后续状态同步。
+        if message_id:
+            repo.register_task_card(
+                task.uid, message_id, operator_open_id,
+                viewer_open_id=operator_open_id, kind="confirmed",
+                version=task.version,
+            )
         # 给负责人推任务卡：建单之后真正要干活的是他，不是发起人。
         # 放后台线程发，回调本身必须秒回（飞书 3 秒不响应会重推）。
         _push_task_card_async(task)
+        _reply_task_created_async(cand.message_id, task)
+        # 日历同步：确认建单后去应用主日历建一个「截止前 15 分钟」的占用块。
+        # 内部自带开关和后台线程，没开权限时这一行等于什么都没做。
+        try:
+            import calendar_sync
+            calendar_sync.on_created_async(task.uid)
+        except Exception as exc:
+            print(f"[CAL] 建单后日历同步启动失败：{type(exc).__name__}: {exc}")
         return Outcome(
             "success", "已建单",
-            cards.build_confirmed_card(cand, task),
+            cards.build_task_card(task, operator_open_id),
         )
 
     if action == cards.ACTION_REJECT:
@@ -108,7 +134,7 @@ def process(action: str, cid: str = "", operator_open_id: str = "",
 
     return Outcome(
         "error", f"未知操作：{action}",
-        cards.build_stale_card(cand, f"按钮动作「{action}」不认识"),
+        None,
         ok=False,
     )
 
@@ -133,7 +159,13 @@ def _process_task(action: str, tid: str, operator_open_id: str,
             ok=False,
         )
 
+    business_roles = permissions.roles_of(task, operator_open_id) - {permissions.ROLE_ADMIN}
+    if not business_roles:
+        return Outcome("warning", "当前账号无权操作此任务", None, ok=False)
     viewer = None if pub else operator_open_id
+    if action == "supplement" and permissions.can(task, operator_open_id, action).ok:
+        return Outcome("info", "请回复本任务卡填写交付物和截止时间",
+                       cards.build_task_card(task, viewer))
     result = repo.transition_task(
         tid, action, operator_open_id=operator_open_id, expected_version=ver,
     )
@@ -155,6 +187,8 @@ def _process_task(action: str, tid: str, operator_open_id: str,
     # 2) 状态/权限不允许：把原因写在卡片上，让人知道为什么点不动
     # 3) 任务不存在：上面已经挡掉了
     latest = repo.get_task(tid) or task
+    if result.message.startswith("请回复本任务卡"):
+        return Outcome("info", result.message, cards.build_task_card(latest, viewer, hint=result.message), ok=False)
     if result.conflict:
         return Outcome(
             "warning", "任务已被别人更新，卡片已刷新",
@@ -189,6 +223,19 @@ def _push_task_card_async(task) -> None:
     threading.Thread(target=_run, name=f"push-{task.uid[:8]}", daemon=True).start()
 
 
+def _reply_task_created_async(message_id: str, task) -> None:
+    """独立发送发起人私聊回执，回调和负责人任务卡不等待它。"""
+    def _run() -> None:
+        try:
+            import feishu_api
+            feishu_api.reply_task_created(message_id, task)
+        except Exception as exc:
+            print(f"[REPLY] 私聊建单回执异常 task={task.uid} "
+                  f"original_message={message_id or '-'}: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_run, name=f"reply-{task.uid[:8]}", daemon=True).start()
+
+
 # ---------------------------------------------------------------- 飞书适配层
 
 def _to_response(outcome: Outcome):
@@ -200,15 +247,15 @@ def _to_response(outcome: Outcome):
     # CallBackCard 实例。SDK 的 init() 会拿字典递归反序列化，
     # 遇到实例会抛 UnmarshalException（错误信息还写着 expected X but was X，
     # 特别难懂）。
-    return P2CardActionTriggerResponse({
+    payload = {
         "toast": {
             "type": outcome.toast_type,
             "content": outcome.toast_content,
         },
-        # type=raw 表示直接用这份 JSON 覆盖卡片，
-        # 不需要先建卡片实体，也不用管卡片 ID
-        "card": {"type": "raw", "data": outcome.card},
-    })
+    }
+    if outcome.card is not None:
+        payload["card"] = {"type": "raw", "data": outcome.card}
+    return P2CardActionTriggerResponse(payload)
 
 
 def handle(event: Any):
@@ -234,7 +281,10 @@ def handle(event: Any):
         print(f"[CARD] 收到回调 action={action} "
               f"cid={cid[:8] or '-'} tid={tid[:8] or '-'} ver={ver} "
               f"pub={int(pub)} operator={operator[:12]}")
-        return _to_response(process(action, cid, operator, tid=tid, ver=ver, pub=pub))
+        context = getattr(data, "context", None)
+        message_id = getattr(context, "open_message_id", "") or ""
+        return _to_response(process(action, cid, operator, tid=tid, ver=ver, pub=pub,
+                                    message_id=message_id))
     except Exception as exc:
         print(f"[CARD] 回调处理异常：{type(exc).__name__}: {exc}")
         try:

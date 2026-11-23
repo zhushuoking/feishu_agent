@@ -24,7 +24,7 @@ import permissions
 import state_machine
 from models_db import (
     TASK_BLOCKED, TASK_CANCELLED, TASK_DONE, TASK_IN_PROGRESS,
-    TASK_PENDING_ACCEPTANCE, TASK_TODO,
+    TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE, TASK_TODO,
 )
 
 ACTION_CONFIRM = "confirm"
@@ -38,6 +38,7 @@ TEMPLATE_MUTED = "grey"
 
 # 任务状态 → 卡片头部配色。用颜色先传达状态，别让人读文字才知道。
 STATUS_TEMPLATE = {
+    TASK_NEEDS_INFO: "orange",
     TASK_TODO: "blue",
     TASK_IN_PROGRESS: "turquoise",
     TASK_BLOCKED: "red",
@@ -107,7 +108,10 @@ def _missing_line(cand) -> str:
         "assignee": "负责人", "deliverable": "交付物", "deadline": "截止时间",
         "acceptance_criteria": "验收标准", "task_content": "任务内容",
     }
-    items = [labels.get(f, f) for f in (cand.missing_fields or [])]
+    fields = list(cand.missing_fields or [])
+    if cand.deadline_status in {"missing", "unresolved"} and "deadline" not in fields:
+        fields.append("deadline")
+    items = [labels.get(f, f) for f in fields]
     return "、".join(items) if items else "无"
 
 
@@ -150,8 +154,7 @@ def _note(content: str) -> Dict[str, Any]:
 
 def build_candidate_card(cand) -> Dict[str, Any]:
     """群/私聊里推给发起人确认的卡片。"""
-    needs_info = bool(cand.missing_fields) or cand.deadline_status == "unresolved"
-    template = TEMPLATE_NEEDS_INFO if needs_info else TEMPLATE_PENDING
+    template = TEMPLATE_NEEDS_INFO if cand.needs_info else TEMPLATE_PENDING
 
     elements: List[Dict[str, Any]] = [
         {
@@ -248,11 +251,22 @@ def build_task_card(task, viewer_open_id: Optional[str] = None,
         _field("负责人", "、".join(at(i) for i in task.owner_open_ids) or "未指定"),
         _field("交付物", task.deliverable or "未指定"),
         _field("发起人", at(task.creator_open_id)),
+        _field("验收人", at(task.effective_reviewer_open_id)),
     ]
     if task.acceptance_criteria:
         fields.append(_field("验收标准", task.acceptance_criteria, short=False))
+    if task.completion_note:
+        fields.append(_field("完成说明", task.completion_note, short=False))
+    if task.review_note:
+        fields.append(_field("处理意见", task.review_note, short=False))
+    if task.status == TASK_NEEDS_INFO:
+        fields.append(_field("待补充", "、".join(task.missing_info), short=False))
 
     elements: List[Dict[str, Any]] = [{"tag": "div", "fields": fields}]
+    if task.status == TASK_NEEDS_INFO:
+        elements.append({"tag": "div", "text": _md(
+            "请回复本卡填写：\n补充信息\n交付物：需要提交的具体成果\n截止时间：明确的日期和时间"
+        )})
 
     if hint:
         elements.append({"tag": "hr"})
@@ -283,12 +297,13 @@ def build_task_card(task, viewer_open_id: Optional[str] = None,
             "tag": "div",
             "text": _md("任务已结束，不需要再操作。"),
         })
+    elif status == TASK_PENDING_ACCEPTANCE and viewer_open_id in task.owner_open_ids:
+        elements.append({"tag": "div", "text": _md("已提交验收，可回复本任务卡补充完成说明。")})
     else:
-        # 只有私聊卡会走到这里：这个人确实没权限推进。
         # 群卡不会出现「一个按钮都没有」——状态允许的动作总会渲染出来。
         elements.append({
             "tag": "div",
-            "text": _md("你在这条任务上没有可执行的动作（只有负责人和发起人能推进它）。"),
+            "text": _md("当前账号没有可执行的动作。"),
         })
 
     elements.append(_note(f"任务 {task.uid[:8]}　状态 v{task.version}"))
@@ -432,6 +447,18 @@ def build_confirmed_card(cand, task) -> Dict[str, Any]:
             },
             _note(f"任务 {task.uid[:8]}　候选 {cand.uid[:8]}"),
         ],
+    }
+
+
+def build_merged_task_card(task) -> Dict[str, Any]:
+    """无法撤回的历史副本只保留合并提示，操作入口由原卡承载。"""
+    return {
+        "config": {"wide_screen_mode": True, "update_multi": True},
+        "header": {"template": TEMPLATE_MUTED,
+                   "title": {"tag": "plain_text", "content": "任务卡已合并"}},
+        "elements": [{"tag": "div", "text": _md(
+            f"{task.title}\n请在本会话的原任务卡继续处理。"
+        )}],
     }
 
 

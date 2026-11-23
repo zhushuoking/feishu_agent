@@ -4,13 +4,14 @@ from datetime import datetime
 
 import pytest
 
+import card_action
 import db
 import repo
 from tests.helpers import save_one
 
 
 @pytest.fixture(autouse=True)
-def _no_event_flush(monkeypatch):
+def _no_live_delivery(monkeypatch):
     """测试里绝不真发消息、绝不真改卡片。
 
     Day 13 之后，每次状态流转都会往发件箱塞事件通知，并且会尝试后台发送。
@@ -25,10 +26,21 @@ def _no_event_flush(monkeypatch):
     一开会多出几条通知，把「同一天只入队一条」这类断言全冲掉。
     新提醒在 tests/test_reminders.py 里单独打开来验。
     """
+    monkeypatch.setenv("FEISHU_ALLOWED_CHAT_IDS", "oc_001")
+    monkeypatch.setenv("FEISHU_DISABLED_CHAT_IDS", "")
+    monkeypatch.setenv("FEISHU_CHAT_MANAGER_BINDINGS", "")
+    monkeypatch.setenv("FEISHU_CHAT_REVIEWER_BINDINGS", "")
+    monkeypatch.setattr(card_action, "_push_task_card_async", lambda task: None)
+    monkeypatch.setattr(card_action, "_reply_task_created_async", lambda message_id, task: None)
     monkeypatch.setenv("EVENT_FLUSH_IMMEDIATE", "0")
     monkeypatch.setenv("CARD_SYNC_ENABLED", "0")
     monkeypatch.setenv("DUE_REMINDER_ENABLED", "0")
     monkeypatch.setenv("OVERDUE_REMINDER_ENABLED", "0")
+    monkeypatch.setenv("INFO_REMINDER_ENABLED", "0")
+    monkeypatch.setenv("TASK_INFO_REMINDER_ENABLED", "0")
+    # Day 16：建单和状态流转会起线程去调飞书日历接口，单测一律关掉。
+    # 日历逻辑本身在 tests/test_calendar_sync.py 里用注入假 api 单独验。
+    monkeypatch.setenv("CALENDAR_SYNC_ENABLED", "0")
 
 
 @pytest.fixture()

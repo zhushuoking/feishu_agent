@@ -18,7 +18,7 @@ OWNER2 = "ou_lisi"
 
 
 def _notifications():
-    return repo.list_notifications(limit=50)
+    return sorted(repo.list_notifications(limit=50), key=lambda row: row.id)
 
 
 def test_submit_notifies_creator(task):
@@ -87,7 +87,7 @@ def test_unblock_also_notifies_creator(task):
 
 
 def test_cancel_notifies_owner(task):
-    repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR)
+    repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR, note="测试取消")
 
     rows = [r for r in _notifications() if r.kind == "task_event"]
     assert [r.receive_id for r in rows] == [OWNER]
@@ -106,7 +106,7 @@ def test_same_change_enqueued_once(task):
 def test_each_owner_gets_own_notification(database):
     """两个负责人就要两通知：去重键里带 open_id，否则第二个会被唯一约束吞掉。"""
     task = make_task(owners=(OWNER, OWNER2))
-    repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR)
+    repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR, note="测试取消")
 
     rows = [r for r in _notifications() if r.kind == "task_event"]
     assert sorted(r.receive_id for r in rows) == sorted([OWNER, OWNER2])
@@ -136,7 +136,7 @@ def test_self_action_does_not_notify_self(database):
     import db as _db
     with _db.session_scope() as s:
         s.execute(update(Task).where(Task.uid == task.uid)
-                  .values(creator_open_id=OWNER)
+                  .values(creator_open_id=OWNER, reviewer_open_id=None)
                   .execution_options(synchronize_session=False))
 
     repo.transition_task(task.uid, "start", operator_open_id=OWNER)
@@ -152,7 +152,7 @@ def test_other_person_action_still_notifies(database):
     task = make_task(owners=(OWNER,), creator=CREATOR)
     repo.transition_task(task.uid, "start", operator_open_id=OWNER)
     repo.transition_task(task.uid, "submit", operator_open_id=OWNER)
-    repo.transition_task(task.uid, "reject", operator_open_id=CREATOR)
+    repo.transition_task(task.uid, "reject", operator_open_id=CREATOR, note="测试退回")
 
     rows = [r for r in _notifications() if r.kind == "task_event"]
     assert [r.receive_id for r in rows] == [CREATOR, OWNER]
@@ -178,7 +178,7 @@ def test_no_creator_does_not_crash(database):
     from models_db import Task
 
     with _db.session_scope() as s:
-        s.execute(update(Task).where(Task.uid == task.uid).values(creator_open_id=None)
+        s.execute(update(Task).where(Task.uid == task.uid).values(creator_open_id=None, reviewer_open_id=None)
                   .execution_options(synchronize_session=False))
 
     result = repo.transition_task(task.uid, "start", operator_open_id=OWNER)
@@ -191,7 +191,7 @@ def test_keys_are_unique_across_versions(task):
     """提交 → 打回 → 再提交，是三次不同的事件，不能被去重吃掉。"""
     repo.transition_task(task.uid, "start", operator_open_id=OWNER)
     repo.transition_task(task.uid, "submit", operator_open_id=OWNER)
-    repo.transition_task(task.uid, "reject", operator_open_id=CREATOR)
+    repo.transition_task(task.uid, "reject", operator_open_id=CREATOR, note="测试退回")
     repo.transition_task(task.uid, "submit", operator_open_id=OWNER)
 
     submit_keys = [

@@ -31,6 +31,9 @@ class ExtractedTask(BaseModel):
     deadline_text: Optional[str] = Field(None, description="截止时间的原文表述，不要自己换算")
     acceptance_criteria: Optional[str] = Field(None, description="验收标准")
     priority: Literal["normal", "urgent"] = "normal"
+    priority_evidence: Optional[str] = Field(
+        None, description="该任务明确要求紧急或加急的原文片段，没有则留空"
+    )
     missing_fields: List[MissingField] = Field(default_factory=list)
     evidence: str = Field("", description="支撑该判断的原文片段")
 

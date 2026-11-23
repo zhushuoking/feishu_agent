@@ -13,7 +13,11 @@
 """
 
 import argparse
+import os
 import sys
+
+import httpx
+from dotenv import load_dotenv
 
 import db
 import repo
@@ -85,6 +89,27 @@ def show_tasks(limit: int = 20) -> None:
         print()
 
 
+def _verified_operator() -> str:
+    """由飞书验证当前用户身份，避免命令行直接自报 open_id。"""
+    token = os.environ.get("FEISHU_USER_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise ValueError("请使用飞书确认卡，或为当前终端设置 FEISHU_USER_ACCESS_TOKEN")
+    try:
+        response = httpx.get(
+            "https://open.feishu.cn/open-apis/authen/v1/user_info",
+            headers={"Authorization": f"Bearer {token}"}, timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("code") == 0:
+            operator = (data.get("data") or {}).get("open_id")
+            if isinstance(operator, str) and operator.startswith("ou_"):
+                return operator
+    except (httpx.HTTPError, ValueError):
+        pass
+    raise ValueError("飞书未能验证当前用户身份，请检查网络和用户访问令牌")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="查看任务库")
     parser.add_argument("--candidates", action="store_true", help="只看候选")
@@ -94,9 +119,11 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="候选含非 pending 状态")
     parser.add_argument("--expire", action="store_true", help="跑一次候选过期")
     parser.add_argument("--confirm", metavar="UID", help="确认指定候选（前缀即可）")
+    parser.add_argument("--reviewer", metavar="OPEN_ID", help="确认建单时指定验收人")
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
 
+    load_dotenv()
     db.init_db()
 
     if args.expire:
@@ -106,15 +133,18 @@ def main() -> None:
 
     if args.confirm:
         uid = args.confirm
-        target = next(
-            (c for c in repo.list_candidates(status=CAND_PENDING, limit=200)
-             if c.uid.startswith(uid)),
-            None,
-        )
-        if target is None:
-            print(f"没找到 pending 候选：{uid}")
-            sys.exit(1)
-        task = repo.confirm_candidate(target.uid, operator_open_id="ou_cli")
+        try:
+            operator = _verified_operator()
+            candidates = repo.pending_candidates_by_prefix(uid)
+            if len(candidates) != 1:
+                raise ValueError("请提供唯一的待确认候选编号")
+            task = repo.confirm_candidate(
+                candidates[0].uid, operator_open_id=operator, reviewer_open_id=args.reviewer,
+            )
+            if task is None:
+                raise ValueError("候选已被处理")
+        except ValueError as exc:
+            sys.exit(str(exc))
         print(f"已建单：{task.uid[:8]}  {task.title}")
         print(f"  状态={task.status}  负责人={task.owner_open_ids}  "
               f"截止={_fmt_time(task.deadline_at)}  {'[逾期]' if task.is_overdue else ''}")

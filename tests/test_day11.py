@@ -50,7 +50,7 @@ def test_todo_card_buttons_differ_by_role(task):
     """同一张待开始的任务卡，负责人和发起人看到的按钮不一样 ——
     这就是「按人渲染」的意义。"""
     owner_card = cards.build_task_card(task, OWNER)
-    assert _actions(owner_card) == ["start"]
+    assert _actions(owner_card) == ["start", "block", "submit"]
     assert owner_card["header"]["title"]["content"] == "任务·待开始"
 
     # 取消是发起人的权利，负责人看不到这个按钮（看到了点了也会被拒）
@@ -73,7 +73,7 @@ def test_group_card_shows_all_status_actions(task):
     任务就这么卡住了。
     """
     card = cards.build_task_card(task, None)
-    assert _actions(card) == ["start", "cancel"]
+    assert _actions(card) == ["start", "block", "submit", "cancel"]
     assert all(b["value"].get("pub") == 1 for b in _buttons(card))
     assert "按你的身份校验" in _text(card)
 
@@ -114,7 +114,7 @@ def test_group_card_rejects_stranger_but_stays_public(task):
     outcome = card_action.process(value["act"], operator_open_id=STRANGER,
                                   tid=value["tid"], ver=value["ver"], pub=True)
     assert not outcome.ok
-    assert all(b["value"].get("pub") == 1 for b in _buttons(outcome.card))
+    assert outcome.card is None
     assert repo.get_task(task.uid).status == TASK_TODO
 
 
@@ -221,14 +221,14 @@ def test_stale_version_is_rejected(task):
 
 
 def test_permission_denied_keeps_card_usable(task):
-    """陌生人点不了，但卡片还是能看、状态没变。"""
+    """无权点击者收到提示，原卡保持可用。"""
     outcome = card_action.process("start", operator_open_id=STRANGER,
                                   tid=task.uid, ver=1)
     assert not outcome.ok
-    assert outcome.toast_type == "error"
-    assert "负责人" in outcome.toast_content or "发起人" in outcome.toast_content
+    assert outcome.toast_type == "warning"
+    assert "无权" in outcome.toast_content
     assert repo.get_task(task.uid).status == TASK_TODO
-    assert outcome.card["header"]["title"]["content"] == "任务·待开始"
+    assert outcome.card is None
 
 
 def test_unknown_task_returns_stale_card():

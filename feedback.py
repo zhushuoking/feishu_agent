@@ -11,7 +11,7 @@
 
 【刻意不做的两件事】
 
-1. 不认「@机器人 做完了」这种不带回复的消息。
+1. 处理回复原派活消息或私聊任务卡的反馈。
    群里同时有五件事在跑，猜错一次就改错一条任务。
    代价不对等：让人多点一下「回复」，比改错一条任务便宜得多。
 
@@ -30,8 +30,9 @@ import db
 import permissions
 import repo
 import state_machine
+import deadline
 from models import MessageCommand
-from models_db import TASK_TERMINAL, Task, TaskCandidate
+from models_db import TASK_TERMINAL, Task, TaskCandidate, TaskCard
 
 # 动作 → 关键词。列表顺序就是优先级。
 # 为什么「完成」排最前：「已经做完了，不用再等审批」这种句子会同时命中
@@ -48,7 +49,10 @@ _RULES: List[Tuple[str, Tuple[str, ...]]] = [
 ]
 
 # 问句不是结论。「做完了吗」「搞定没有？」都不是在说「已经做完」。
-_QUESTION = re.compile(r"[?？]\s*$|\s*吗\s*$")
+_QUESTION = re.compile(r"[?？]|(?:吗|么|没有|没|了吗|了没)[。.!！\s]*$")
+
+# 条件、计划和转述不能作为操作者已经执行动作的依据。
+_NON_ASSERTION = re.compile(r"如果|假如|要是|等到|一旦|计划|打算|准备|预计|争取|希望|请问|是不是|是否")
 
 # 否定：「还没做完」「没卡住」。关键词前面三个字里出现否定词就整条作废。
 # 只往前看，所以「不做了」这种自带否定的说法不会被自己挡掉。
@@ -62,6 +66,7 @@ class Reading:
     action: str
     keyword: str
     reason: str
+    note: Optional[str] = None
 
 
 @dataclass
@@ -78,8 +83,18 @@ def classify(text: str) -> Optional[Reading]:
     body = (text or "").strip()
     if not body:
         return None
-    if _QUESTION.search(body):
+    if _QUESTION.search(body) or _NON_ASSERTION.search(body):
         return None
+
+    review_text = re.sub(r"^(?:ok|好的?)[，,\s]*", "", body, flags=re.IGNORECASE).rstrip("。.!！ ")
+    review = re.fullmatch(r"(验收通过|验收合格|验收不通过|验收打回|打回重做|取消任务)(?:[：:，,]\s*(.+))?", review_text)
+    review_action = {
+        "验收通过": "accept", "验收合格": "accept",
+        "验收不通过": "reject", "验收打回": "reject", "打回重做": "reject",
+        "取消任务": "cancel",
+    }.get(review.group(1) if review else "")
+    if review_action:
+        return Reading(review_action, review.group(1), "明确的处理结论", note=review.group(2) or "")
 
     for action, words in _RULES:
         for keyword in words:
@@ -93,26 +108,30 @@ def classify(text: str) -> Optional[Reading]:
 
 
 def resolve_tasks(cmd: MessageCommand) -> List[Task]:
-    """从回复关系里找出这句话说的是哪几条任务。
-
-    只认回复：回复的那条消息 = 当初派活的那条消息 → 沿候选找到正式任务。
-    """
-    ids = [x for x in (cmd.parent_id, cmd.root_id) if x]
-    if not ids:
-        return []
-
-    with db.session_scope() as s:
-        cand_uids = list(s.scalars(
-            select(TaskCandidate.uid).where(TaskCandidate.message_id.in_(ids))
-        ).all())
-        if not cand_uids:
-            return []
-        task_uids = list(s.scalars(
-            select(Task.uid).where(Task.candidate_uid.in_(cand_uids))
-        ).all())
-
-    tasks = [repo.get_task(uid) for uid in task_uids]
-    return [t for t in tasks if t is not None]
+    """优先关联直接回复的任务卡，再查根消息；私聊按收件人校验。"""
+    ids = list(dict.fromkeys(x for x in (cmd.parent_id, cmd.root_id) if x))
+    for message_id in ids:
+        with db.session_scope() as session:
+            if cmd.chat_type == "p2p":
+                task_uids = list(session.scalars(
+                    select(Task.uid).join(TaskCard, TaskCard.task_id == Task.id).where(
+                        TaskCard.message_id == message_id,
+                        TaskCard.receive_id_type == "open_id",
+                        TaskCard.receive_id == cmd.sender_open_id,
+                        TaskCard.viewer_open_id == cmd.sender_open_id,
+                    )
+                ).all())
+            else:
+                task_uids = list(session.scalars(
+                    select(Task.uid).join(TaskCandidate, Task.candidate_uid == TaskCandidate.uid).where(
+                        TaskCandidate.message_id == message_id, Task.chat_id == cmd.chat_id,
+                    )
+                ).all())
+        tasks = [repo.get_task(uid) for uid in dict.fromkeys(task_uids)]
+        tasks = [task for task in tasks if task and permissions.chat_enabled(task.chat_id)]
+        if tasks:
+            return tasks
+    return []
 
 
 def _would_succeed(task: Task, action: str, open_id: str) -> bool:
@@ -124,7 +143,7 @@ def _would_succeed(task: Task, action: str, open_id: str) -> bool:
 
 
 def apply_feedback(cmd: MessageCommand) -> Applied:
-    """把一句话落到任务上。返回给群里回什么。
+    """把一句话落到任务上。返回发送给操作者私聊的处理结果。
 
     多层防护，每层都对应一个真实的错法：
     - 不是状态反馈       → 当作没看见，继续走任务识别
@@ -133,6 +152,8 @@ def apply_feedback(cmd: MessageCommand) -> Applied:
     - 任务都已结束       → 告诉他不用改了
     - 一句话对应多条任务 → 只处理唯一能成的那条，否则让他点卡片
     """
+    if (cmd.text or "").strip().splitlines()[:1] == ["补充信息"]:
+        return _apply_supplement(cmd)
     reading = classify(cmd.text)
     if not reading:
         return Applied(False)
@@ -169,7 +190,7 @@ def apply_feedback(cmd: MessageCommand) -> Applied:
     target = possible[0]
     result = repo.transition_task(
         target.uid, reading.action, operator_open_id=cmd.sender_open_id,
-        note=cmd.text[:200],
+        note=(reading.note or "") if reading.action in ("reject", "cancel") else cmd.text[:2000],
     )
     if not result.ok:
         return Applied(False, "状态没改成：%s" % result.message)
@@ -181,3 +202,33 @@ def apply_feedback(cmd: MessageCommand) -> Applied:
         "已记录：「%s」→ %s（v%d）" % (fresh.title, label, fresh.version),
         fresh,
     )
+
+
+def _apply_supplement(cmd: MessageCommand) -> Applied:
+    tasks = resolve_tasks(cmd)
+    if len(tasks) != 1:
+        return Applied(False, "请回复需要补充的那张任务卡，再填写交付物和截止时间。")
+    fields = {}
+    for line in cmd.text.strip().splitlines()[1:]:
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"\s*(交付物|截止时间)\s*[：:]\s*(.+?)\s*", line)
+        if not match or match.group(1) in fields:
+            return Applied(False, "请每行填写一项，格式为“交付物：具体成果”或“截止时间：明天18点前”。")
+        fields[match.group(1)] = match.group(2)
+    parsed = None
+    if "截止时间" in fields:
+        parsed = deadline.parse_deadline(fields["截止时间"], cmd.sent_at or db.now())
+        if not parsed.ok:
+            return Applied(False, "截止时间还不明确，请填写具体日期和时间后重试。")
+    result = repo.supplement_task(
+        tasks[0].uid, cmd.sender_open_id, deliverable=fields.get("交付物"),
+        deadline_at=parsed.deadline_at if parsed else None,
+        deadline_text=parsed.raw if parsed else None, note=cmd.text[:2000],
+    )
+    text = result.message
+    if result.ok and parsed:
+        text += f"；截止时间按 {parsed.deadline_at:%Y-%m-%d %H:%M} 记录"
+        if parsed.assumed:
+            text += "（含默认时间口径）"
+    return Applied(result.ok, text, result.task)

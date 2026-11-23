@@ -12,12 +12,15 @@
 import json
 from datetime import datetime, timedelta
 
+import pytest
+
+import db
 import notify
 import repo
 import worker
 from models import TZ_SHANGHAI
-from models_db import NOTIFY_SENT, TASK_DONE
-from tests.helpers import make_task
+from models_db import NOTIFY_SENT, TASK_DONE, TASK_PENDING_ACCEPTANCE
+from tests.helpers import make_cmd, make_recognition, make_task
 
 OWNER = "ou_zhangsan"
 OWNER2 = "ou_lisi"
@@ -25,6 +28,80 @@ CREATOR = "ou_sender"       # make_task 落库的发言人，跟 owners 无关
 
 # 2026-11-20 是周五，工作日，10:00 不在免打扰时段
 NOW = datetime(2026, 11, 20, 10, 0, tzinfo=TZ_SHANGHAI)
+
+
+def _info_candidate(monkeypatch, *, fields=("assignee",), age=60, sender=CREATOR,
+                    deadline_status="resolved", ttl_hours=72):
+    monkeypatch.setenv("INFO_REMINDER_ENABLED", "1")
+    monkeypatch.setattr(notify, "should_plan", lambda now: False)
+    monkeypatch.setattr(db, "now", lambda: NOW - timedelta(minutes=age))
+    recognition = make_recognition()
+    recognition.tasks[0].missing_fields = list(fields)
+    recognition.tasks[0].deadline_status = deadline_status
+    return repo.save_candidates(
+        recognition, make_cmd(sender_open_id=sender), ttl_hours=ttl_hours,
+    )[0]
+
+
+@pytest.mark.parametrize("fields,deadline_status", [
+    (("assignee",), "resolved"), ((), "unresolved"), ((), "missing"),
+])
+def test_info_reminder_is_private_actionable_and_sent_once(
+    database, monkeypatch, fields, deadline_status,
+):
+    cand = _info_candidate(monkeypatch, fields=fields, deadline_status=deadline_status)
+    rows = []
+    sender = lambda row: rows.append(row) or True
+
+    assert worker.tick(NOW, dry_run=True, sender=sender)["info"] == 1
+    assert repo.claim_pending_notifications(NOW) == []
+    assert worker.tick(NOW, sender=sender)["info"] == 1
+    assert worker.tick(NOW + timedelta(minutes=1), sender=sender)["info"] == 0
+
+    row, = rows
+    assert row.kind == "needs_info"
+    assert row.dedupe_key == f"NEEDS_INFO:{cand.uid}"
+    assert row.receive_id_type == "open_id"
+    assert row.receive_id == CREATOR
+    card = json.loads(row.payload)
+    values = [button["value"] for element in card["elements"]
+              for button in element.get("actions", [])]
+    assert {value["act"] for value in values} == {"confirm", "reject"}
+    assert {value["cid"] for value in values} == {cand.uid}
+
+
+@pytest.mark.parametrize("case", ["young", "complete", "no_sender", "expired", "confirmed",
+                                  "rejected", "disabled", "quiet"])
+def test_no_info_reminder_when_candidate_is_ineligible(database, monkeypatch, case):
+    cand = _info_candidate(
+        monkeypatch, fields=() if case == "complete" else ("deliverable",),
+        age=59 if case == "young" else 60, sender="" if case == "no_sender" else CREATOR,
+        ttl_hours=1 if case == "expired" else 72,
+    )
+    if case == "confirmed":
+        assert repo.confirm_candidate(cand.uid, operator_open_id=CREATOR)
+    if case == "rejected":
+        assert repo.reject_candidate(cand.uid, operator_open_id=CREATOR)
+    if case == "disabled":
+        monkeypatch.setenv("INFO_REMINDER_ENABLED", "0")
+
+    now = NOW.replace(hour=23) if case == "quiet" else NOW
+    assert worker.tick(now, sender=lambda row: pytest.fail(row.kind))["info"] == 0
+    if case == "quiet":
+        after_quiet = (NOW + timedelta(days=1)).replace(hour=8)
+        assert worker.tick(after_quiet, sender=lambda row: True)["sent"] == 1
+
+
+def test_retry_skips_candidate_already_processed(database, monkeypatch):
+    cand = _info_candidate(monkeypatch)
+    assert worker.tick(NOW, sender=lambda row: False)["failed"] == 1
+    assert repo.reject_candidate(cand.uid, operator_open_id=CREATOR)
+
+    sender = lambda row: pytest.fail("processed candidate sent again")
+    assert worker.tick(NOW, dry_run=True, sender=sender)["skipped"] == 1
+    assert len(repo.claim_pending_notifications(NOW)) == 1
+    assert worker.tick(NOW, sender=sender)["skipped"] == 1
+    assert repo.claim_pending_notifications(NOW) == []
 
 
 def at(day: int, hour: int, minute: int = 0) -> datetime:
@@ -81,6 +158,45 @@ def test_terminal_task_is_not_reminded(database):
     make_task(deadline_at=at(21, 9), owners=(OWNER,), status=TASK_DONE)
     assert notify.plan_due_reminders(NOW) == []
     assert notify.plan_overdue_reminders(NOW) == []
+
+
+@pytest.mark.parametrize("deadline", [at(20, 9), at(20, 18)])
+def test_pending_acceptance_has_no_owner_reminders(database, deadline):
+    make_task(deadline_at=deadline, status=TASK_PENDING_ACCEPTANCE)
+    assert notify.plan_due_reminders(NOW) == []
+    assert notify.plan_overdue_reminders(NOW) == []
+    assert notify.plan_digests(NOW) == []
+
+
+@pytest.mark.parametrize("kind", ["due_24h", "overdue"])
+def test_already_queued_reminder_is_skipped_after_submission(database, kind):
+    deadline = at(20, 18) if kind == "due_24h" else at(20, 9)
+    task = make_task(deadline_at=deadline)
+    reminders = notify.plan_due_reminders(NOW) if kind == "due_24h" else notify.plan_overdue_reminders(NOW)
+    worker._enqueue_reminders(reminders, NOW, False, "test")
+    assert repo.transition_task(task.uid, "start", OWNER).ok
+    assert repo.transition_task(task.uid, "submit", OWNER).ok
+    # 验收通知由状态流转产生，正常投递；普通催办应全部跳过。
+    sent = []
+    result = worker.drain_outbox(NOW + timedelta(minutes=1), sender=lambda row: sent.append(row.kind) or True)
+    assert result["skipped"] == len(reminders)
+    assert all(item == "task_event" for item in sent)
+
+
+def test_queued_digest_is_refreshed_after_submission(database):
+    submitted = make_task(deadline_at=at(20, 18), title="pending report")
+    make_task(deadline_at=at(20, 18), title="active report")
+    digest, = notify.plan_digests(NOW)
+    import cards
+    repo.enqueue_notification(digest.dedupe_key, OWNER,
+                              cards.card_to_content(cards.build_digest_card(digest, NOW)), scheduled_at=NOW)
+    assert repo.transition_task(submitted.uid, "start", OWNER).ok
+    assert repo.transition_task(submitted.uid, "submit", OWNER).ok
+    sent = []
+    worker.drain_outbox(NOW + timedelta(minutes=1), sender=lambda row: sent.append(row) or True)
+    daily, = [row for row in sent if row.kind == "digest"]
+    assert "active report" in daily.payload
+    assert "pending report" not in daily.payload
 
 
 def test_task_without_deadline_is_not_reminded(database):

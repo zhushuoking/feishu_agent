@@ -31,8 +31,9 @@ from typing import Dict, List, Optional
 
 import db
 import repo
+import permissions
 from models import TZ_SHANGHAI
-from models_db import TASK_TERMINAL, Task
+from models_db import CAND_PENDING, TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE, TASK_TERMINAL, Task, TaskCandidate
 
 # 日报几点发（北京时间）。08 点前入队会提前发出去，所以要卡这个点。
 SEND_HOUR = int(os.getenv("DIGEST_SEND_HOUR", "9"))
@@ -44,6 +45,21 @@ QUIET_END_HOUR = int(os.getenv("QUIET_END_HOUR", "8"))
 # 补发时限：早上 9 点的日报，如果下午 4 点才有机会发，就别发了。
 # 过期提醒比没有提醒更烦人 —— 收到一条「今天要交」的推送，而今天快过完了。
 MAX_DELAY_HOURS = int(os.getenv("DIGEST_MAX_DELAY_HOURS", "6"))
+INFO_REMINDER_DELAY = timedelta(hours=1)
+INFO_REMINDER_KIND = "needs_info"
+INFO_REMINDER_PREFIX = "NEEDS_INFO:"
+TASK_INFO_KIND = "task_info"
+
+
+def info_reminders_enabled() -> bool:
+    return os.getenv("INFO_REMINDER_ENABLED", "1").strip() != "0"
+
+
+def candidate_needs_info(cand: Optional[TaskCandidate], now: datetime) -> bool:
+    return bool(
+        cand and cand.status == CAND_PENDING and cand.needs_info and permissions.chat_enabled(cand.chat_id)
+        and (cand.expires_at is None or cand.expires_at > now)
+    )
 
 CAT_OVERDUE = "overdue"
 CAT_TODAY = "today"
@@ -105,7 +121,7 @@ def categorize(task: Task, now: datetime) -> Optional[str]:
     逾期优先于「今天到期」：一条今天 10:00 截止、现在 11:00 的任务，
     既逾期又属于今天。归到逾期才对 —— 说「今天到期」会让人以为还有时间。
     """
-    if task.status in TASK_TERMINAL:
+    if task.status in (*TASK_TERMINAL, TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE):
         return None
     if task.deadline_at is None:
         return None
@@ -174,7 +190,7 @@ def should_plan(now: Optional[datetime] = None) -> bool:
     立刻把当天的日报推出去（dedupe_key 是当天的，一入队就发）。
     """
     now = now or db.now()
-    return now.astimezone(TZ_SHANGHAI).hour >= SEND_HOUR
+    return is_workday(now.astimezone(TZ_SHANGHAI).date()) and now.astimezone(TZ_SHANGHAI).hour >= SEND_HOUR
 
 
 def is_too_late(scheduled_at: datetime, now: datetime,
@@ -183,7 +199,20 @@ def is_too_late(scheduled_at: datetime, now: datetime,
 
     早上 9 点的「今天要交」，下午 5 点才发出去等于骂人。
     """
-    return (now - scheduled_at) > timedelta(hours=max_delay_hours)
+    cursor = _aware(scheduled_at)
+    end = _aware(now)
+    active_seconds = 0.0
+    while cursor < end:
+        quiet = in_quiet_hours(cursor)
+        hour = QUIET_END_HOUR if quiet else QUIET_START_HOUR
+        boundary = datetime.combine(cursor.date(), time(hour), tzinfo=TZ_SHANGHAI)
+        if boundary <= cursor:
+            boundary += timedelta(days=1)
+        stop = min(boundary, end)
+        if not quiet:
+            active_seconds += (stop - cursor).total_seconds()
+        cursor = stop
+    return active_seconds > max_delay_hours * 3600
 
 
 # ---------------------------------------------------------------- 到期前 24h / 逾期（设计文档 12.3）
@@ -320,6 +349,8 @@ def plan_due_reminders(now: Optional[datetime] = None,
     out: List[Reminder] = []
 
     for task in repo.list_active_tasks_with_deadline():
+        if task.status == TASK_PENDING_ACCEPTANCE:
+            continue
         deadline = _aware(task.deadline_at)
         if deadline is None or not (now < deadline <= upper):
             continue
@@ -352,6 +383,8 @@ def plan_overdue_reminders(now: Optional[datetime] = None,
     out: List[Reminder] = []
 
     for task in repo.list_active_tasks_with_deadline():
+        if task.status == TASK_PENDING_ACCEPTANCE:
+            continue
         deadline = _aware(task.deadline_at)
         if deadline is None or deadline >= now:
             continue
@@ -365,3 +398,18 @@ def plan_overdue_reminders(now: Optional[datetime] = None,
             out.append(Reminder(KIND_OVERDUE, task, open_id,
                                 overdue_key(task, day_str, open_id), hint))
     return out
+
+
+def plan_task_info_reminders(now: datetime, last_sent=None) -> List[Reminder]:
+    """正式待补充任务每两个工作日提醒确认人和负责人。"""
+    now = _aware(now)
+    last_sent = last_sent or {}
+    reminders = []
+    for task in repo.list_tasks_needing_info():
+        if not should_remind_overdue(now, last_sent.get(task.uid, task.created_at), interval_workdays=2):
+            continue
+        for recipient in _recipients(task, include_creator=True):
+            key = f"TASK_INFO:{task.uid}:{now:%Y-%m-%d}:{recipient}"
+            reminders.append(Reminder(TASK_INFO_KIND, task, recipient, key,
+                                       "请补充" + "、".join(task.missing_info)))
+    return reminders

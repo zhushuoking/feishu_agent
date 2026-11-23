@@ -174,7 +174,7 @@ def test_expire_skips_candidates_still_alive(database):
 def test_confirm_creates_task_with_log(database):
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
 
-    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_manager")
+    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_sender")
     assert task is not None
     assert task.status == TASK_TODO
     assert task.version == 1
@@ -188,29 +188,29 @@ def test_confirm_creates_task_with_log(database):
     assert len(logs) == 1
     assert logs[0].from_status is None
     assert logs[0].to_status == TASK_TODO
-    assert logs[0].operator_open_id == "ou_manager"
+    assert logs[0].operator_open_id == "ou_sender"
 
     assert repo.get_candidate(cand_uid).status == CAND_CONFIRMED
 
 
 def test_confirm_twice_returns_none(database):
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
-    assert repo.confirm_candidate(cand_uid) is not None
-    assert repo.confirm_candidate(cand_uid) is None
+    assert repo.confirm_candidate(cand_uid, operator_open_id="ou_sender") is not None
+    assert repo.confirm_candidate(cand_uid, operator_open_id="ou_sender") is None
     assert repo.count_tasks() == 1
 
 
 def test_confirm_can_override_assignees(database):
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
-    task = repo.confirm_candidate(cand_uid, assignee_open_ids=["ou_lisi"])
+    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_sender", assignee_open_ids=["ou_lisi"])
     assert task.owner_open_ids == ["ou_lisi"]
 
 
 def test_rejected_candidate_cannot_be_confirmed(database):
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
-    assert repo.reject_candidate(cand_uid, "ou_manager") is True
+    assert repo.reject_candidate(cand_uid, "ou_sender") is True
     assert repo.get_candidate(cand_uid).status == CAND_REJECTED
-    assert repo.confirm_candidate(cand_uid) is None
+    assert repo.confirm_candidate(cand_uid, operator_open_id="ou_sender") is None
 
 
 # ---------------------------------------------------------------- 派生与约束
@@ -218,7 +218,7 @@ def test_rejected_candidate_cannot_be_confirmed(database):
 def test_is_overdue_is_derived(database):
     """逾期不落库，靠 deadline_at 和状态算出来。"""
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
-    task = repo.confirm_candidate(cand_uid)
+    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_sender")
 
     with db.session_scope() as s:
         row = s.get(Task, task.id)
@@ -237,7 +237,7 @@ def test_no_deadline_is_never_overdue(database):
         task.deadline_at = None
         task.deadline_status = "missing"
     cand_uid = repo.save_candidates(result, _cmd())[0].uid
-    task = repo.confirm_candidate(cand_uid)
+    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_sender")
     assert task.is_overdue is False
 
 
@@ -250,7 +250,7 @@ def test_foreign_key_is_enforced(database):
 
 def test_cancelled_task_not_overdue(database):
     cand_uid = repo.save_candidates(_recognition(), _cmd())[0].uid
-    task = repo.confirm_candidate(cand_uid)
+    task = repo.confirm_candidate(cand_uid, operator_open_id="ou_sender")
     with db.session_scope() as s:
         row = s.get(Task, task.id)
         row.status = TASK_CANCELLED

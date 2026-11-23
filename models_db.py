@@ -28,6 +28,7 @@ CAND_EXPIRED = "expired"       # 超时未处理
 
 # ---- 任务状态机（设计文档 7.2）----
 TASK_TODO = "TODO"
+TASK_NEEDS_INFO = "NEEDS_INFO"
 TASK_IN_PROGRESS = "IN_PROGRESS"
 TASK_BLOCKED = "BLOCKED"
 TASK_PENDING_ACCEPTANCE = "PENDING_ACCEPTANCE"
@@ -35,7 +36,7 @@ TASK_DONE = "DONE"
 TASK_CANCELLED = "CANCELLED"
 
 TASK_STATUSES = (
-    TASK_TODO, TASK_IN_PROGRESS, TASK_BLOCKED,
+    TASK_NEEDS_INFO, TASK_TODO, TASK_IN_PROGRESS, TASK_BLOCKED,
     TASK_PENDING_ACCEPTANCE, TASK_DONE, TASK_CANCELLED,
 )
 # 终态：不再提醒、不再允许改状态
@@ -89,6 +90,10 @@ class TaskCandidate(Base):
     created_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now)
     updated_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now, onupdate=now)
 
+    @property
+    def needs_info(self) -> bool:
+        return bool(self.missing_fields) or self.deadline_status in {"missing", "unresolved"}
+
     def __repr__(self) -> str:
         return f"<Candidate {self.uid[:8]} {self.status} {self.title[:20]!r}>"
 
@@ -123,9 +128,12 @@ class Task(Base):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     creator_open_id: Mapped[Optional[str]] = mapped_column(String(64))
+    reviewer_open_id: Mapped[Optional[str]] = mapped_column(String(64))
     created_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now)
     updated_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now, onupdate=now)
     completed_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+    completion_note: Mapped[Optional[str]] = mapped_column(Text)
+    review_note: Mapped[Optional[str]] = mapped_column(Text)
 
     assignees: Mapped[List["TaskAssignee"]] = relationship(
         back_populates="task", cascade="all, delete-orphan", lazy="selectin"
@@ -135,16 +143,31 @@ class Task(Base):
     )
 
     @property
+    def effective_reviewer_open_id(self) -> Optional[str]:
+        return self.reviewer_open_id or self.creator_open_id
+
+    @property
     def is_overdue(self) -> bool:
         """是否逾期。派生字段，不落库 —— 落库就要有 Worker 定时改，
         一天不改就全错。设计文档 7.4 明确用派生。"""
-        if self.status in TASK_TERMINAL or self.deadline_at is None:
+        if self.status in (*TASK_TERMINAL, TASK_NEEDS_INFO) or self.deadline_at is None:
             return False
         return self.deadline_at < now()
 
     @property
     def owner_open_ids(self) -> List[str]:
         return [a.open_id for a in self.assignees if a.role == "owner"]
+
+    @property
+    def missing_info(self) -> List[str]:
+        fields = []
+        if not self.owner_open_ids:
+            fields.append("负责人")
+        if not (self.deliverable or "").strip():
+            fields.append("交付物")
+        if self.deadline_at is None:
+            fields.append("截止时间")
+        return fields
 
     def __repr__(self) -> str:
         return f"<Task {self.uid[:8]} {self.status} {self.title[:20]!r}>"
@@ -302,3 +325,98 @@ class NotificationOutbox(Base):
 
     def __repr__(self) -> str:
         return f"<Outbox {self.dedupe_key} {self.status} try={self.attempts}>"
+
+
+# ---- 日历同步状态（Day 16）----
+CAL_PENDING = "pending"    # 占好坑了，创建接口还没成功
+CAL_CREATED = "created"    # 日程已建，event_id 有效
+CAL_DELETED = "deleted"    # 任务取消，日程已删
+CAL_FAILED = "failed"      # 接口失败，留痕等重试
+CAL_SKIPPED = "skipped"    # 主动不建（没截止时间）
+
+
+class TaskCalendarEvent(Base):
+    """任务 ↔ 飞书日程的映射（Day 16）。
+
+    【为什么必须落这张表】
+    飞书没有「按业务 ID 查日程」的可靠方式。不存 event_id，验收完成时就
+    不知道该 PATCH 哪一个、取消时不知道该删哪一个。用户原话就是：
+    「任务和日程保存对应关系，重复操作时更新已有日程」。
+
+    【幂等是两层】
+    1. task_uid 唯一 → 同一条任务最多一行，重复点确认不会建第二个日程
+    2. idempotency_key 固定存下来 → 即使创建成功但进程崩在写库之前，
+       重试带着同一个 key 调飞书，飞书侧也返回原来的 event_id
+
+    【为什么存 task_uid 而不是 task.id 外键】
+    和 notify_outbox 保持一致。后台线程拿到的是 uid，用 uid 查不用先
+    join task 表；detached 对象跨线程也不会踩关系懒加载。
+
+    deadline_at 存的是「建日程那一刻的截止」：以后延期改截止，
+    拿它和 task.deadline_at 一比就知道该不该 PATCH。
+    """
+
+    __tablename__ = "task_calendar_event"
+    __table_args__ = (
+        UniqueConstraint("task_uid", name="uq_calendar_task"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    task_uid: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+
+    calendar_id: Mapped[str] = mapped_column(String(128))
+    event_id: Mapped[str] = mapped_column(String(128), default="")
+    # 32~128 字符，飞书在「应用 + 日历」维度用它去重
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    deadline_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+
+    status: Mapped[str] = mapped_column(String(16), default=CAL_PENDING, index=True)
+    attendees_synced: Mapped[int] = mapped_column(Integer, default=0)
+    synced_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    retry_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+    request_body: Mapped[Optional[str]] = mapped_column(Text)
+    sync_mode: Mapped[str] = mapped_column(String(16), default="application", server_default="application")
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))
+
+    created_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now)
+    updated_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now, onupdate=now)
+    synced_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+
+    def __repr__(self) -> str:
+        return f"<CalendarEvent {self.task_uid[:8]} {self.status} {self.event_id[:12]}>"
+
+
+class CalendarAccount(Base):
+    __tablename__ = "calendar_account"
+    open_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    app_id: Mapped[str] = mapped_column(String(64))
+    calendar_id: Mapped[str] = mapped_column(String(128))
+    encrypted_tokens: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[object] = mapped_column(TZAwareDateTime)
+    updated_at: Mapped[object] = mapped_column(TZAwareDateTime, default=now)
+
+
+class CalendarOAuthState(Base):
+    __tablename__ = "calendar_oauth_state"
+    state_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    open_id: Mapped[str] = mapped_column(String(64))
+    expires_at: Mapped[object] = mapped_column(TZAwareDateTime)
+    used: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PersonalCalendarEvent(Base):
+    __tablename__ = "personal_calendar_event"
+    __table_args__ = (UniqueConstraint("task_uid", "open_id", name="uq_personal_task_user"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_uid: Mapped[str] = mapped_column(String(32), index=True)
+    open_id: Mapped[str] = mapped_column(String(64))
+    calendar_id: Mapped[str] = mapped_column(String(128))
+    event_id: Mapped[str] = mapped_column(String(128), default="")
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_body: Mapped[Optional[str]] = mapped_column(Text)
+    synced_version: Mapped[int] = mapped_column(Integer, default=0)
+    deadline_at: Mapped[Optional[object]] = mapped_column(TZAwareDateTime)
+    status: Mapped[str] = mapped_column(String(16), default=CAL_PENDING)
+    last_error: Mapped[Optional[str]] = mapped_column(String(200))

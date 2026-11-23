@@ -112,3 +112,39 @@ def test_high_confidence_requires_complete_fields():
     payload = _base_payload()
     payload["tasks"][0]["missing_fields"] = ["deadline"]
     assert TaskRecognition.model_validate(payload).high_confidence() is False
+
+
+@pytest.mark.parametrize("source,evidence,expected", [
+    ("今天晚上七点前交给我论文ppt", None, "normal"),
+    ("今天晚上七点前交给我论文ppt", "请紧急提交", "normal"),
+    ("请加急提交论文ppt", "请加急提交论文ppt", "urgent"),
+    ("这是一项紧急任务，请交论文ppt", "紧急任务", "urgent"),
+    ("请优先处理论文ppt", "优先处理", "urgent"),
+    ("这个不紧急，明天交论文ppt", "不紧急", "normal"),
+    ("无需加急处理论文ppt", "无需加急处理论文ppt", "normal"),
+    ("请提交紧急预案培训PPT", "紧急预案培训PPT", "normal"),
+    ("请加急提交论文ppt，不要拖延", "请加急提交论文ppt，不要拖延", "urgent"),
+])
+def test_detect_requires_source_evidence_for_urgent_priority(monkeypatch, source, evidence, expected):
+    from tests.helpers import make_cmd
+
+    payload = _base_payload()
+    payload["tasks"][0].update(priority="urgent", priority_evidence=evidence, evidence=source)
+    monkeypatch.setattr(detector.llm, "chat_json", lambda *args: payload)
+    result = detector.detect(make_cmd(text=source, text_raw=source))
+    assert result.tasks[0].priority == expected
+    if expected == "normal":
+        assert result.tasks[0].priority_evidence is None
+
+
+def test_urgency_is_not_inherited_by_another_task(monkeypatch):
+    from tests.helpers import make_cmd
+
+    source = "请加急提交报告，另请明天提交PPT"
+    payload = _base_payload()
+    first = payload["tasks"][0]
+    first.update(priority="urgent", priority_evidence="请加急提交报告", evidence="请加急提交报告")
+    payload["tasks"].append(dict(first, title="提交PPT", evidence="明天提交PPT"))
+    monkeypatch.setattr(detector.llm, "chat_json", lambda *args: payload)
+    result = detector.detect(make_cmd(text=source, text_raw=source))
+    assert [task.priority for task in result.tasks] == ["urgent", "normal"]

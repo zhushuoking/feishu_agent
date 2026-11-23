@@ -7,6 +7,7 @@
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,7 +89,7 @@ def test_assumed_deadline_is_marked(database):
 
 def test_confirmed_card_has_no_buttons(database):
     cand = save_one()
-    task = repo.confirm_candidate(cand.uid, operator_open_id="ou_mgr")
+    task = repo.confirm_candidate(cand.uid, operator_open_id="ou_sender")
     card = cards.build_confirmed_card(cand, task)
 
     assert _buttons(card) == []
@@ -97,7 +98,7 @@ def test_confirmed_card_has_no_buttons(database):
 
 def test_rejected_card_has_no_buttons(database):
     cand = save_one()
-    card = cards.build_rejected_card(cand, "ou_mgr")
+    card = cards.build_rejected_card(cand, "ou_sender")
     assert _buttons(card) == []
 
 
@@ -105,11 +106,11 @@ def test_rejected_card_has_no_buttons(database):
 
 def test_confirm_creates_task(database):
     cand = save_one()
-    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_mgr")
+    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender")
 
     assert outcome.ok is True
     assert outcome.toast_type == "success"
-    assert _buttons(outcome.card) == []
+    assert all(b["value"]["act"] != cards.ACTION_CONFIRM for b in _buttons(outcome.card))
     assert repo.count_tasks() == 1
     assert repo.get_candidate(cand.uid).status == "confirmed"
 
@@ -121,8 +122,8 @@ def test_confirm_creates_task(database):
 def test_confirm_twice_does_not_create_second_task(database):
     """用户连点两下 / 飞书重推 —— 这是最容易被忽略的坑。"""
     cand = save_one()
-    first = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_mgr")
-    second = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_mgr")
+    first = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender")
+    second = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender")
 
     assert first.ok is True
     assert second.ok is False
@@ -131,8 +132,30 @@ def test_confirm_twice_does_not_create_second_task(database):
     assert repo.count_tasks() == 1
 
 
+def test_creator_confirmation_card_tracks_submission(database):
+    import card_sync
+
+    cand = save_one()
+    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender",
+                                  message_id="om_creator_confirm")
+    assert outcome.ok
+    task = repo.list_tasks()[0]
+    row, = repo.list_live_task_cards(task.uid)
+    assert row.message_id == "om_creator_confirm"
+    assert row.viewer_open_id == "ou_sender"
+    assert repo.transition_task(task.uid, "start", "ou_zhangsan").ok
+    assert repo.transition_task(task.uid, "submit", "ou_zhangsan").ok
+    updates = []
+    stats = card_sync.sync_task(task.uid, updater=lambda mid, card: updates.append((mid, card)) or True)
+    assert stats["updated"] == 1
+    mid, card = updates[0]
+    assert mid == "om_creator_confirm"
+    assert "待验收" in json.dumps(card, ensure_ascii=False)
+    assert any(b["value"]["act"] == "accept" for b in _buttons(card))
+
+
 def test_confirm_unknown_candidate(database):
-    outcome = card_action.process(cards.ACTION_CONFIRM, "deadbeef" * 4, "ou_mgr")
+    outcome = card_action.process(cards.ACTION_CONFIRM, "deadbeef" * 4, "ou_sender")
     assert outcome.ok is False
     assert outcome.toast_type == "error"
     assert repo.count_tasks() == 0
@@ -144,7 +167,7 @@ def test_confirm_expired_candidate_is_refused(database):
     cand = repo.list_candidates(status=None)[0]
     assert repo.expire_candidates() == 1
 
-    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_mgr")
+    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender")
     assert outcome.ok is False
     assert outcome.toast_type == "warning"
     assert "过期" in outcome.toast_content
@@ -157,8 +180,8 @@ def make_cmd_for_expiry():
 
 def test_confirm_rejected_candidate_is_refused(database):
     cand = save_one()
-    repo.reject_candidate(cand.uid, "ou_mgr")
-    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_mgr")
+    repo.reject_candidate(cand.uid, "ou_sender")
+    outcome = card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender")
 
     assert outcome.ok is False
     assert "忽略" in outcome.toast_content
@@ -170,7 +193,7 @@ def test_confirm_rejected_candidate_is_refused(database):
 
 def test_reject_marks_candidate(database):
     cand = save_one()
-    outcome = card_action.process(cards.ACTION_REJECT, cand.uid, "ou_mgr")
+    outcome = card_action.process(cards.ACTION_REJECT, cand.uid, "ou_sender")
 
     assert outcome.ok is True
     assert outcome.toast_type == "info"
@@ -180,8 +203,8 @@ def test_reject_marks_candidate(database):
 
 def test_reject_twice_is_noop(database):
     cand = save_one()
-    card_action.process(cards.ACTION_REJECT, cand.uid, "ou_mgr")
-    second = card_action.process(cards.ACTION_REJECT, cand.uid, "ou_mgr")
+    card_action.process(cards.ACTION_REJECT, cand.uid, "ou_sender")
+    second = card_action.process(cards.ACTION_REJECT, cand.uid, "ou_sender")
     assert second.ok is False
     assert second.toast_type == "warning"
 
@@ -189,14 +212,14 @@ def test_reject_twice_is_noop(database):
 # ---------------------------------------------------------------- 边界
 
 def test_empty_cid_is_handled(database):
-    outcome = card_action.process(cards.ACTION_CONFIRM, "", "ou_mgr")
+    outcome = card_action.process(cards.ACTION_CONFIRM, "", "ou_sender")
     assert outcome.ok is False
     assert outcome.toast_type == "error"
 
 
 def test_unknown_action_is_handled(database):
     cand = save_one()
-    outcome = card_action.process("delete_everything", cand.uid, "ou_mgr")
+    outcome = card_action.process("delete_everything", cand.uid, "ou_sender")
     assert outcome.ok is False
     assert "未知操作" in outcome.toast_content
     assert repo.get_candidate(cand.uid).status == "pending"
@@ -208,7 +231,7 @@ def test_handle_extracts_fields_and_returns_response(database):
     cand = save_one()
     event = _Obj(event=_Obj(
         action=_Obj(value={"act": cards.ACTION_CONFIRM, "cid": cand.uid}),
-        operator=_Obj(open_id="ou_mgr"),
+        operator=_Obj(open_id="ou_sender"),
         context=_Obj(open_message_id="om_card", open_chat_id="oc_001"),
     ))
 
@@ -218,7 +241,10 @@ def test_handle_extracts_fields_and_returns_response(database):
     assert resp.toast.type == "success"
     assert resp.toast.content == "已建单"
     assert resp.card.type == "raw"
-    assert resp.card.data["header"]["template"] == cards.TEMPLATE_DONE
+    task = repo.list_tasks()[0]
+    assert resp.card.data == cards.build_task_card(task, "ou_sender")
+    row, = repo.list_live_task_cards(task.uid)
+    assert row.message_id == "om_card"
     assert repo.count_tasks() == 1
 
 
@@ -234,8 +260,68 @@ def test_handle_supports_long_keys(database):
     cand = save_one()
     event = _Obj(event=_Obj(
         action=_Obj(value={"action": cards.ACTION_REJECT, "candidate_uid": cand.uid}),
-        operator=_Obj(open_id="ou_mgr"),
+        operator=_Obj(open_id="ou_sender"),
     ))
     resp = card_action.handle(event)
     assert resp.toast.type == "info"
     assert repo.get_candidate(cand.uid).status == CAND_REJECTED
+
+
+def test_only_first_successful_confirm_schedules_receipt(database, monkeypatch):
+    sent = []
+    monkeypatch.setattr(card_action, "_reply_task_created_async",
+                        lambda message_id, task: sent.append((message_id, task.uid)))
+    cand = save_one(message_id="om_original")
+    ignored = save_one(message_id="om_ignored")
+
+    assert card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender").ok
+    assert not card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender").ok
+    assert card_action.process(cards.ACTION_REJECT, ignored.uid, "ou_sender").ok
+    assert not card_action.process(cards.ACTION_CONFIRM, ignored.uid, "ou_sender").ok
+    assert repo.count_tasks() == 1
+    assert len(sent) == 1
+    original_message, task_uid = sent[0]
+    assert original_message == cand.message_id
+    assert repo.get_task(task_uid).title == cand.title
+
+
+@pytest.mark.parametrize("mode", ["success", "api_failure", "network_error", "missing_id"])
+def test_creation_receipt_is_a_private_task_card(database, monkeypatch, mode):
+    import feishu_api
+
+    cand = save_one(message_id="" if mode == "missing_id" else "om_original")
+    requests = []
+    monkeypatch.setattr(card_action, "_reply_task_created_async", feishu_api.reply_task_created)
+
+    def create(request):
+        requests.append(request)
+        if mode == "network_error":
+            raise OSError("connection lost")
+        return SimpleNamespace(
+            success=lambda: mode != "api_failure", data=SimpleNamespace(message_id="om_receipt"),
+            code=123, msg="permission denied", get_log_id=lambda: "log_id",
+        )
+
+    def reply(request):
+        pytest.fail("建单回执应发送到机器人私聊")
+
+    monkeypatch.setattr(feishu_api, "get_client", lambda: SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(create=create, reply=reply))),
+    ))
+    assert card_action.process(cards.ACTION_CONFIRM, cand.uid, "ou_sender").ok
+    task, = repo.list_tasks()
+    request, = requests
+    assert request.receive_id_type == "open_id"
+    assert request.request_body.receive_id == "ou_sender"
+    assert request.request_body.msg_type == "interactive"
+    assert request.request_body.uuid
+    assert json.loads(request.request_body.content) == cards.build_task_card(task, "ou_sender")
+    if mode in ("api_failure", "network_error"):
+        row, = repo.list_notifications()
+        assert row.kind == "task_created"
+        assert row.receive_id == "ou_sender"
+        assert row.task_uid == task.uid
+    else:
+        row, = repo.list_live_task_cards(task.uid)
+        assert row.message_id == "om_receipt"
+        assert row.viewer_open_id == "ou_sender"

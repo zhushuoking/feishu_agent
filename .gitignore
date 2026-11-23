@@ -13,6 +13,9 @@ venv/
 *.db-shm
 *.db-wal
 *.sqlite3
+# SQLite 的临时回滚日志，机器人运行时会瞬间出现又消失，
+# 不加这条会让 git add -A 撞上 "unable to index file"
+*-journal
 *.log
 
 # ---- Python 缓存 ----

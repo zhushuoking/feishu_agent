@@ -219,8 +219,8 @@ def test_failed_before_max_attempts_stays_pending(database):
 def test_drain_skips_too_late(database):
     """早上 9 点的日报，下午 4 点才轮到 —— 别发了。"""
     repo.enqueue_notification("K1", "ou_a", "{}",
-                              scheduled_at=NOW - timedelta(hours=7))
-    stats = worker.drain_outbox(NOW, sender=lambda row: True)
+                              scheduled_at=NOW)
+    stats = worker.drain_outbox(NOW + timedelta(hours=7), sender=lambda row: True)
 
     assert stats["skipped"] == 1
     assert repo.list_notifications()[0].status == NOTIFY_SKIPPED
@@ -297,17 +297,13 @@ def test_digest_card_truncates_long_lists(database):
     assert "还有 2 条" in _text(card)
 
 
-def test_digest_card_without_buttons_still_readable(database):
-    """任务在待验收、本人是负责人 —— 没权限推进，但日报照样要能读。"""
+def test_pending_acceptance_is_excluded_from_owner_digest(database):
+    """负责人已提交完成后，从催办日报移除。"""
     task = make_task(deadline_at=at(17, 14))
     repo.transition_task(task.uid, "start", operator_open_id="ou_zhangsan")
     repo.transition_task(task.uid, "submit", operator_open_id="ou_zhangsan")
 
-    digest = notify.plan_digests(NOW)[0]
-    card = cards.build_digest_card(digest, NOW)
-
-    assert _buttons(card) == []
-    assert "待验收" in _text(card)
+    assert notify.plan_digests(NOW) == []
 
 
 # ---------------------------------------------------------------- 端到端

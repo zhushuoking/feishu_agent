@@ -6,6 +6,7 @@
 3. 两个人同时改，只有一个成功（靠 version 乐观锁）
 """
 
+import db
 import permissions
 import repo
 import state_machine
@@ -84,7 +85,7 @@ def test_completed_at_only_set_on_done(task):
 
 
 def test_next_actions_order(task):
-    assert state_machine.next_actions(TASK_TODO) == ["start", "cancel"]
+    assert state_machine.next_actions(TASK_TODO) == ["start", "block", "submit", "cancel"]
     assert state_machine.next_actions(TASK_PENDING_ACCEPTANCE) == ["accept", "reject", "cancel"]
     assert state_machine.next_actions(TASK_DONE) == []
 
@@ -104,7 +105,7 @@ def test_owner_cannot_accept_own_work(task):
 def test_stranger_cannot_do_anything(task):
     result = repo.transition_task(task.uid, "start", operator_open_id=STRANGER)
     assert not result.ok
-    assert "不是这个任务的负责人或发起人" in result.message
+    assert "无权" in result.message
 
 
 def test_creator_cannot_start_someone_elses_task(task):
@@ -118,15 +119,15 @@ def test_only_creator_can_cancel(task):
     denied = repo.transition_task(task.uid, "cancel", operator_open_id=OWNER)
     assert not denied.ok
 
-    ok = repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR)
+    ok = repo.transition_task(task.uid, "cancel", operator_open_id=CREATOR, note="测试取消")
     assert ok.ok
     assert ok.task.status == TASK_CANCELLED
 
 
-def test_admin_can_do_anything(task, monkeypatch):
+def test_technical_admin_cannot_do_business_actions(task, monkeypatch):
     monkeypatch.setenv("AGENT_ADMIN_OPEN_IDS", f"{STRANGER},ou_another")
     result = repo.transition_task(task.uid, "start", operator_open_id=STRANGER)
-    assert result.ok
+    assert not result.ok
 
 
 def test_empty_operator_is_rejected(task):
@@ -134,21 +135,19 @@ def test_empty_operator_is_rejected(task):
     assert not result.ok
 
 
-def test_task_without_owner_falls_back_to_creator(database):
-    """没 @ 到人的任务如果没人能推动，就会永远卡在待开始。"""
-    result = make_recognition(tasks=[{
-        "title": "补一份说明", "deliverable": "说明文档",
-        "deadline_text": "明天", "assignee_mention_ids": [], "missing_fields": ["assignee"],
-    }])
-    cand = repo.save_candidates(result, make_cmd())[0]
-    task = repo.confirm_candidate(cand.uid, operator_open_id=CREATOR)
+def test_legacy_task_without_owner_requires_assignment(task):
+    """旧任务缺少负责人时无法代行负责人操作。"""
+    from models_db import Task
+
+    with db.session_scope() as s:
+        legacy_task = s.get(Task, task.id)
+        legacy_task.assignees.clear()
+    task = repo.get_task(task.uid)
 
     assert task.owner_open_ids == []
     started = repo.transition_task(task.uid, "start", operator_open_id=CREATOR)
-    assert started.ok
-    assert "代行" in permissions.can(
-        repo.get_task(task.uid), CREATOR, "block"
-    ).reason
+    assert not started.ok
+    assert not permissions.can(repo.get_task(task.uid), CREATOR, "block")
 
 
 def test_can_reports_role(task):
@@ -157,9 +156,8 @@ def test_can_reports_role(task):
     assert permissions.describe_roles(task, STRANGER) == "与该任务无关"
 
 
-def test_self_accept_is_allowed_but_logged(database):
-    """自己给自己布置活的情况：允许自验收，否则任务永远走不完，
-    但流水里必须留下「自验收」，事后能查出来。"""
+def test_owner_cannot_self_accept_even_when_creator(database):
+    """负责人兼任发起人时仍由其他验收人处理。"""
     result = make_recognition(tasks=[{
         "title": "整理周报", "deliverable": "周报",
         "deadline_text": "明天", "assignee_mention_ids": [CREATOR], "missing_fields": [],
@@ -172,9 +170,9 @@ def test_self_accept_is_allowed_but_logged(database):
 
     _go(task, "start", "submit", operator=CREATOR)
     done = repo.transition_task(task.uid, "accept", operator_open_id=CREATOR)
-    assert done.ok
-    assert done.task.status == TASK_DONE
-    assert "自验收" in repo.list_task_logs(task.uid)[-1].reason
+    assert not done.ok
+    assert "不能自行验收" in done.message
+    assert repo.get_task(task.uid).status == TASK_PENDING_ACCEPTANCE
 
 
 # ---------------------------------------------------------------- 乐观锁

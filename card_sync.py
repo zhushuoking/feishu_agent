@@ -56,7 +56,7 @@ def _stale_hint():
 
 
 def sync_task(task_uid: str, updater: Optional[Callable] = None,
-              limit: int = repo.MAX_LIVE_CARDS) -> Dict[str, int]:
+              limit: int = repo.MAX_LIVE_CARDS, deleter: Optional[Callable] = None) -> Dict[str, int]:
     """把一条任务的所有活卡片刷成当前状态。返回统计。
 
     updater 是参数不是写死的（和 worker 的 sender 一个套路）：
@@ -69,7 +69,7 @@ def sync_task(task_uid: str, updater: Optional[Callable] = None,
       （transition 前它记的是旧版本，所以这里仍会再刷一次，内容一样，
        多一次请求但绝不会刷成错的 —— 宁可多发一次，不可漏发）
     """
-    stats = {"checked": 0, "updated": 0, "failed": 0, "skipped": 0}
+    stats = {"checked": 0, "updated": 0, "failed": 0, "skipped": 0, "deleted": 0, "merged": 0}
 
     task = repo.get_task(task_uid)
     if task is None:
@@ -81,8 +81,46 @@ def sync_task(task_uid: str, updater: Optional[Callable] = None,
         return stats
 
     update = updater or _default_updater
+    verified_primaries = set()
 
     for row in rows:
+        if row.receive_id_type == "open_id" and row.viewer_open_id:
+            primary = repo.get_primary_task_card(task_uid, row.viewer_open_id)
+            if primary and primary.message_id != row.message_id:
+                if primary.synced_version > task.version:
+                    stats["skipped"] += 1
+                    continue
+                # 删除副本前先确认原卡可正常更新，避免原卡已被用户删除。
+                if primary.message_id not in verified_primaries:
+                    try:
+                        ready = update(primary.message_id, cards.build_task_card(task, row.viewer_open_id))
+                    except Exception:
+                        ready = False
+                    if not ready:
+                        stats["failed"] += 1
+                        continue
+                    verified_primaries.add(primary.message_id)
+                    repo.mark_task_card_synced(primary.message_id, task.version)
+                    stats["updated"] += 1
+                try:
+                    removed = (deleter or _default_deleter)(row.message_id)
+                except Exception:
+                    removed = False
+                if removed:
+                    repo.retire_task_card(row.message_id)
+                    stats["deleted"] += 1
+                else:
+                    # 超过撤回时限的副本仍可编辑，收成简短提示后停止同步。
+                    try:
+                        merged = update(row.message_id, cards.build_merged_task_card(task))
+                    except Exception:
+                        merged = False
+                    if merged:
+                        repo.retire_task_card(row.message_id)
+                        stats["merged"] += 1
+                    else:
+                        stats["failed"] += 1
+                continue
         if (row.synced_version or 0) >= task.version:
             stats["skipped"] += 1
             continue
@@ -117,6 +155,27 @@ def _default_updater(message_id: str, card) -> bool:
     import feishu_api
 
     return feishu_api.update_card(message_id, card)
+
+
+def _default_deleter(message_id: str) -> bool:
+    import feishu_api
+
+    return feishu_api.delete_message(message_id)
+
+
+def reconcile() -> Dict[str, int]:
+    stats = {"updated": 0, "deleted": 0, "merged": 0, "failed": 0}
+    if not _enabled():
+        return stats
+    import permissions
+
+    for task_uid in repo.tasks_needing_card_sync():
+        task = repo.get_task(task_uid)
+        if task and permissions.chat_enabled(task.chat_id):
+            result = sync_task(task_uid)
+            for key in stats:
+                stats[key] += result[key]
+    return stats
 
 
 def sync_async(task_uid: str, version: Optional[int] = None) -> None:

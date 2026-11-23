@@ -42,6 +42,7 @@ import cards
 import card_action
 import feedback
 import events
+import permissions
 import feishu_api
 
 load_dotenv()
@@ -49,7 +50,7 @@ load_dotenv()
 APP_ID = os.getenv("FEISHU_APP_ID", "")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 
-STATS = {"total": 0, "from_bot": 0, "duplicate": 0, "accepted": 0}
+STATS = {"total": 0, "from_bot": 0, "duplicate": 0, "filtered": 0, "accepted": 0}
 _db_ready = False
 # 识别出候选后是否自动推确认卡片。调提示词阶段可以关掉，免得刷屏。
 AUTO_PUSH_CARD = os.getenv("CARD_AUTO_PUSH", "1").strip() != "0"
@@ -58,6 +59,12 @@ AUTO_PUSH_CARD = os.getenv("CARD_AUTO_PUSH", "1").strip() != "0"
 def on_message(data: P2ImMessageReceiveV1) -> None:
     cmd = models.parse_event(data.event, data.header)
     STATS["total"] += 1
+
+    if cmd.chat_type not in ("group", "p2p") or (
+            cmd.chat_type == "group" and not permissions.chat_enabled(cmd.chat_id)):
+        STATS["filtered"] += 1
+        print("[SKIP] 群未授权或已停用，忽略消息")
+        return
 
     # 1) 过滤机器人自身消息：必须在去重之前，避免污染 event_inbox
     if cmd.is_from_bot:
@@ -71,19 +78,34 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         print(f"[DUP ] 重复事件 {cmd.event_id} 已忽略")
         return
 
-    # 3) 状态反馈：回复原消息说「做完了」「卡住了」，直接改状态。
+    # 3) 状态反馈：回复原消息或私聊任务卡说「做完了」「卡住了」，按权限改状态。
+    if cmd.chat_type == "p2p" and cmd.text.strip() == "连接日历":
+        import calendar_auth
+        try:
+            text = "请使用本人飞书账号完成一次授权：\n" + calendar_auth.authorization_link(cmd.sender_open_id)
+        except calendar_auth.AuthorizationRequired as exc:
+            text = str(exc)
+        feishu_api.send_text_to_user(cmd.sender_open_id, text)
+        return
     #    放在识别任务之前 —— 「做完了」要是先过一遍任务识别，
     #    模型很可能把它当成一条新任务建出来。
     try:
         applied = feedback.apply_feedback(cmd)
         if applied.text:
             print(f"[反馈] {applied.text}")
-            feishu_api.send_text_to_chat(cmd.chat_id, applied.text)
+            feishu_api.send_text_to_user(cmd.sender_open_id, applied.text)
             if applied.ok:
                 events.flush_async()
             return
     except Exception as exc:  # 反馈层出错不该挡住正常的任务识别
         print(f"[反馈] 处理异常：{type(exc).__name__}: {exc}")
+
+    if cmd.chat_type == "p2p":
+        feishu_api.send_text_to_user(
+            cmd.sender_open_id,
+            "请点击任务卡上的按钮，或回复对应任务卡说「开始做」「做完了」「验收通过」。",
+        )
+        return
 
     # 4) 进入后续流程：Day 3 调模型识别任务
     STATS["accepted"] += 1
@@ -151,6 +173,9 @@ def main() -> None:
     store.init_db()   # 事件去重表（sqlite3 直连）
     db.init_db()      # 业务表（SQLAlchemy）：候选 / 任务 / 负责人 / 状态流水
     _db_ready = True
+    if os.getenv("CALENDAR_SYNC_ENABLED", "0") != "0" and os.getenv("CALENDAR_SYNC_MODE", "application") == "personal":
+        import calendar_auth
+        calendar_auth.start_server()
 
     handler = (
         lark.EventDispatcherHandler.builder("", "")
@@ -164,7 +189,7 @@ def main() -> None:
         APP_ID,
         APP_SECRET,
         event_handler=handler,
-        log_level=lark.LogLevel.INFO,
+        log_level=lark.LogLevel.WARNING,
     )
 
     print("已就绪：消息接入 + 识别 + 时间解析 + 候选落库 + 确认卡片")

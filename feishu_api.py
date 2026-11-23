@@ -10,6 +10,7 @@
 
 import json
 import os
+import uuid
 from typing import Any, Dict, Optional
 
 _FEISHU_NO_PROXY = "open.feishu.cn,.feishu.cn,msg-frontier.feishu.cn,localhost,127.0.0.1"
@@ -23,6 +24,7 @@ from dotenv import load_dotenv
 from lark_oapi.api.im.v1 import (
     CreateMessageRequest, CreateMessageRequestBody,
     PatchMessageRequest, PatchMessageRequestBody,
+    DeleteMessageRequest,
 )
 
 load_dotenv()
@@ -48,7 +50,7 @@ def get_client() -> lark.Client:
 
 
 def _send(receive_id: str, receive_id_type: str, msg_type: str,
-          content: str) -> Optional[str]:
+          content: str, message_key: str = "") -> Optional[str]:
     req = (
         CreateMessageRequest.builder()
         .receive_id_type(receive_id_type)
@@ -57,6 +59,7 @@ def _send(receive_id: str, receive_id_type: str, msg_type: str,
             .receive_id(receive_id)
             .msg_type(msg_type)
             .content(content)
+            .uuid(str(uuid.uuid5(uuid.NAMESPACE_URL, message_key)) if message_key else None)
             .build()
         )
         .build()
@@ -72,6 +75,18 @@ def _send(receive_id: str, receive_id_type: str, msg_type: str,
               f"log_id={getattr(resp, 'get_log_id', lambda: '-')()}")
         return None
     return resp.data.message_id if resp.data else None
+
+
+def reply_task_created(message_id: str, task) -> Optional[str]:
+    """建单回执统一发送到发起人与机器人的私聊。message_id 保留兼容调用。"""
+    import cards
+
+    if not task.creator_open_id:
+        print(f"[CARD] 建单回执缺少发起人 task={task.uid}")
+        return None
+    return _deliver_task_card(task, task.creator_open_id,
+                              cards.build_task_card(task, task.creator_open_id),
+                              kind="task_created")
 
 
 def send_card_to_chat(chat_id: str, card: Dict[str, Any]) -> Optional[str]:
@@ -122,6 +137,20 @@ def update_card(message_id: str, card: Dict[str, Any]) -> bool:
     return True
 
 
+def delete_message(message_id: str) -> bool:
+    """清理本机器人已登记的重复任务卡。"""
+    try:
+        response = get_client().im.v1.message.delete(
+            DeleteMessageRequest.builder().message_id(message_id).build(),
+        )
+        if not response.success():
+            print(f"[CARD] 清理重复卡失败 code={response.code} msg={response.msg}")
+        return response.success()
+    except Exception as exc:
+        print(f"[CARD] 清理重复卡片失败 message={message_id[:12]} {type(exc).__name__}")
+        return False
+
+
 def _remember_card(task, message_id: str, receive_id: str,
                    receive_id_type: str, viewer_open_id: str = "") -> None:
     """把发出去的卡片记进 task_card，状态变了才找得到它。
@@ -143,9 +172,10 @@ def _remember_card(task, message_id: str, receive_id: str,
               f"{type(exc).__name__}: {exc}")
 
 
-def send_card_to_user(open_id: str, card: Dict[str, Any]) -> Optional[str]:
+def send_card_to_user(open_id: str, card: Dict[str, Any],
+                      message_key: str = "") -> Optional[str]:
     return _send(open_id, "open_id", "interactive",
-                 json.dumps(card, ensure_ascii=False))
+                 json.dumps(card, ensure_ascii=False), message_key=message_key)
 
 
 def send_text_to_chat(chat_id: str, text: str) -> Optional[str]:
@@ -154,67 +184,70 @@ def send_text_to_chat(chat_id: str, text: str) -> Optional[str]:
                  json.dumps({"text": text}, ensure_ascii=False))
 
 
-def send_text_to_user(open_id: str, text: str) -> Optional[str]:
+def send_text_to_user(open_id: str, text: str, message_key: str = "") -> Optional[str]:
     return _send(open_id, "open_id", "text",
-                 json.dumps({"text": text}, ensure_ascii=False))
+                 json.dumps({"text": text}, ensure_ascii=False), message_key=message_key)
 
 
 def push_confirm_card(cand, card: Dict[str, Any],
                       prefer: Optional[str] = None) -> Optional[str]:
-    """把确认卡片推给任务发起人。
+    """确认卡统一私聊发起人。prefer 参数保留供旧调用使用。"""
+    import repo
 
-    优先私聊：确认动作是「发起人自己的事」，扔进群里会打扰所有人，
-    而且群里点错人也没人负责。
-    私聊失败（对方没和机器人建立会话、企业策略禁止）就回落群里 @他，
-    这种情况下卡片里已经 @ 了负责人，不会丢。
-    """
-    prefer = (prefer or os.getenv("CARD_TARGET", "auto")).lower()
     sender = cand.sender_open_id
+    if not sender:
+        print(f"[CARD] 确认卡缺少发起人 candidate={cand.uid}")
+        return None
+    key = f"CANDIDATE:{cand.uid}"
+    message_id = send_card_to_user(sender, card, message_key=key)
+    if not message_id:
+        repo.enqueue_notification(key, sender, json.dumps(card, ensure_ascii=False),
+                                  kind="candidate_confirm")
+        print(f"[CARD] 确认卡私聊失败，已安排重试 candidate={cand.uid}")
+    return message_id
 
-    if prefer in ("dm", "auto") and sender:
-        message_id = send_card_to_user(sender, card)
-        if message_id:
-            print(f"[CARD] 已私聊发起人 {sender[:12]}… message_id={message_id}")
-            return message_id
-        if prefer == "dm":
+
+def _deliver_task_card(task, open_id: str, card: Dict[str, Any],
+                       kind: str) -> Optional[str]:
+    """立即私聊，失败时使用同一消息标识交给现有发件箱重试。"""
+    import repo
+
+    key = f"{kind}:{task.uid}:{open_id}"
+    message_id = upsert_task_card(task, open_id, card)
+    if not message_id:
+        repo.enqueue_notification(
+            key, open_id, json.dumps(card, ensure_ascii=False), kind=kind,
+            task_uid=task.uid, task_version=task.version,
+        )
+        print(f"[CARD] 任务卡私聊失败，已安排重试 task={task.uid[:8]}")
+    return message_id
+
+
+def upsert_task_card(task, open_id: str, card: Dict[str, Any]) -> Optional[str]:
+    """已有卡片只更新。首次发送在所有通知种类间使用相同的去重标识。"""
+    import repo
+
+    current = repo.get_primary_task_card(task.uid, open_id)
+    if current:
+        if current.synced_version > task.version:
+            return current.message_id
+        if not update_card(current.message_id, card):
             return None
-        print("[CARD] 私聊发送失败，回落到群消息")
-
-    message_id = send_card_to_chat(cand.chat_id, card)
+        repo.mark_task_card_synced(current.message_id, task.version)
+        return current.message_id
+    message_id = send_card_to_user(open_id, card, message_key=f"TASK:{task.uid}:{open_id}")
     if message_id:
-        print(f"[CARD] 已发到群 {cand.chat_id[:12]}… message_id={message_id}")
+        _remember_card(task, message_id, open_id, "open_id", viewer_open_id=open_id)
     return message_id
 
 
 def push_task_card(task, card: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """把带状态按钮的任务卡推给负责人。
+    """带操作按钮的任务卡统一私聊各负责人。"""
+    import cards
 
-    按负责人逐个私聊（按钮要按「这个人能做什么」渲染，所以每个负责人一张卡）。
-    一个都发不出去就回落到来源群，一张卡带 @ 提醒。
-    """
-    import cards  # 局部导入：cards 只在这一处用到，别让模块级 import 顺序变复杂
-
-    owners = list(dict.fromkeys(task.owner_open_ids))
     sent = 0
-    for open_id in owners:
+    for open_id in dict.fromkeys(task.owner_open_ids):
         rendered = card or cards.build_task_card(task, open_id)
-        message_id = send_card_to_user(open_id, rendered)
-        if message_id:
+        if _deliver_task_card(task, open_id, rendered, kind="task_assignment"):
             sent += 1
-            print(f"[CARD] 任务卡已私聊 {open_id[:12]}… message_id={message_id}")
-            _remember_card(task, message_id, open_id, "open_id",
-                           viewer_open_id=open_id)
-
-    if sent:
-        return "ok"
-
-    print("[CARD] 负责人私聊全部失败，回落到群消息")
-    # 回落时**必须重新渲染成公共卡**（viewer=None）：群里所有人看同一份，
-    # 按某个人的权限裁剪按钮会让其他人以为自己也点不了。
-    # 传进来的 card 是私聊视角的，这里不能直接用。
-    fallback = cards.build_task_card(task, None)
-    message_id = send_card_to_chat(task.chat_id, fallback)
-    if message_id:
-        # 群卡是公共视角，viewer 留空 —— 同步时要按这个重新渲染
-        _remember_card(task, message_id, task.chat_id, "chat_id")
-    return message_id
+    return "ok" if sent else None

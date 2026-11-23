@@ -114,14 +114,14 @@ def test_stranger_cannot_change_status(database):
     assert repo.get_task(task.uid).status == TASK_IN_PROGRESS
 
 
-def test_wrong_state_says_so(database):
-    """任务还没开始就有人说做完了：状态机不放行，得说清楚。"""
+def test_todo_can_submit_completion_per_design(database):
+    """设计 §6.3 允许待开始任务直接提交验收。"""
     task = make_task(owners=(OWNER,), status=TASK_TODO)
     applied = feedback.apply_feedback(_reply_to(task, "做完了"))
 
-    assert not applied.ok
+    assert applied.ok
     assert applied.text
-    assert repo.get_task(task.uid).status == TASK_TODO
+    assert repo.get_task(task.uid).status == "PENDING_ACCEPTANCE"
 
 
 def test_finished_task_is_not_touched(database):

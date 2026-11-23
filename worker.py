@@ -26,9 +26,10 @@ main.py 扛着飞书长连接，是「实时」链路；Worker 是「定时」�
 import argparse
 import json
 import os
+import sqlite3
 import sys
 import time as time_module
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 from dotenv import load_dotenv
@@ -38,7 +39,9 @@ load_dotenv()
 import cards
 import db
 import notify
+import permissions
 import repo
+from models_db import CAND_PENDING, TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE, TASK_TERMINAL
 
 DEFAULT_INTERVAL = int(os.getenv("WORKER_INTERVAL_SECONDS", "60"))
 
@@ -48,11 +51,29 @@ def _default_sender(row) -> bool:
     import feishu_api
 
     card = json.loads(row.payload)
+    if row.task_uid and row.receive_id_type == "open_id":
+        task = repo.get_task(row.task_uid)
+        if task is None:
+            return True
+        # 发件箱可能等过免打扰时段，发送时重新使用最新版本。
+        if row.task_version != task.version:
+            card = cards.build_task_card(task, row.receive_id)
+        if not feishu_api.upsert_task_card(task, row.receive_id, card):
+            return False
+        if row.kind in ("task_event", notify.KIND_DUE, notify.KIND_OVERDUE, notify.TASK_INFO_KIND):
+            from state_machine import STATUS_LABELS
+            label = {notify.KIND_DUE: "到期提醒", notify.KIND_OVERDUE: "逾期提醒",
+                     notify.TASK_INFO_KIND: "待补充提醒"}.get(row.kind, STATUS_LABELS.get(task.status, task.status))
+            return bool(feishu_api.send_text_to_user(
+                row.receive_id, f"{task.title}｜{label}",
+                message_key=row.dedupe_key,
+            ))
+        return True
     if row.receive_id_type == "chat_id":
         message_id = feishu_api.send_card_to_chat(row.receive_id, card)
         viewer = ""                      # 群卡是公共视角
     else:
-        message_id = feishu_api.send_card_to_user(row.receive_id, card)
+        message_id = feishu_api.send_card_to_user(row.receive_id, card, message_key=row.dedupe_key)
         viewer = row.receive_id          # 私聊卡按这个人渲染
 
     if not message_id:
@@ -83,10 +104,97 @@ def _remember_card(row, message_id: str, viewer_open_id: str = "") -> None:
         print(f"  [WARN] 卡片登记失败 {row.dedupe_key}：{type(exc).__name__}: {exc}")
 
 
+def _refresh_reminder(row, now: datetime) -> bool:
+    """发送前按最新业务状态复核，并重建可能已过时的卡片。"""
+    if row.kind == "task_event":
+        task = repo.get_task(row.task_uid)
+        if (task is None or not permissions.chat_enabled(task.chat_id)
+                or row.task_version != task.version):
+            return False
+    if row.kind == notify.TASK_INFO_KIND:
+        task = repo.get_task(row.task_uid)
+        if (os.getenv("TASK_INFO_REMINDER_ENABLED", "1") == "0"
+                or task is None or task.status != TASK_NEEDS_INFO
+                or not permissions.chat_enabled(task.chat_id)
+                or row.receive_id not in {*task.owner_open_ids, task.creator_open_id}):
+            return False
+        row.payload = cards.card_to_content(cards.build_task_card(task, row.receive_id,
+                                                                  hint="请补充" + "、".join(task.missing_info)))
+        row.task_version = task.version
+    if row.kind == "candidate_confirm":
+        cand = repo.get_candidate(row.dedupe_key.removeprefix("CANDIDATE:"))
+        if (cand is None or cand.status != CAND_PENDING or cand.expires_at <= now
+                or cand.sender_open_id != row.receive_id or not permissions.chat_enabled(cand.chat_id)):
+            return False
+        row.payload = cards.card_to_content(cards.build_candidate_card(cand))
+    if row.kind in ("task_assignment", "task_created"):
+        task = repo.get_task(row.task_uid)
+        if task is None or not permissions.chat_enabled(task.chat_id):
+            return False
+        if row.kind == "task_assignment" and (
+                task.status in TASK_TERMINAL or row.receive_id not in task.owner_open_ids):
+            return False
+        row.payload = cards.card_to_content(cards.build_task_card(task, row.receive_id))
+        row.task_version = task.version
+    if row.kind == "digest" and row.dedupe_key.startswith("DIGEST:"):
+        digest = next(
+            (item for item in notify.plan_digests(now)
+             if item.open_id == row.receive_id and item.dedupe_key == row.dedupe_key),
+            None,
+        )
+        if digest is None:
+            return False
+        row.payload = cards.card_to_content(cards.build_digest_card(digest, now))
+    if row.kind in (notify.KIND_DUE, notify.KIND_OVERDUE):
+        key_parts = row.dedupe_key.split(":")
+        task_uid = row.task_uid or (key_parts[1] if len(key_parts) > 1 else "")
+        task = repo.get_task(task_uid)
+        if (task is None or not permissions.chat_enabled(task.chat_id)
+                or task.status in (*TASK_TERMINAL, TASK_NEEDS_INFO, TASK_PENDING_ACCEPTANCE)):
+            return False
+        deadline = notify._aware(task.deadline_at)
+        if deadline is None:
+            return False
+        if row.kind == notify.KIND_DUE:
+            if (row.receive_id not in task.owner_open_ids
+                    or row.dedupe_key != notify.due_key(task, row.receive_id)
+                    or not now < deadline <= now + timedelta(hours=notify.DUE_WINDOW_HOURS)):
+                return False
+            hint = "到期提醒，请及时处理"
+        else:
+            if (deadline >= now or not notify.is_workday(now.date())
+                    or row.receive_id not in {*task.owner_open_ids, task.creator_open_id}):
+                return False
+            hint = "任务已逾期，请反馈进展"
+        row.payload = cards.card_to_content(cards.build_task_card(task, row.receive_id, hint=hint))
+        row.task_uid = task.uid
+        row.task_version = task.version
+    return True
+
+
 def drain_outbox(now: Optional[datetime] = None,
                  sender: Optional[Callable] = None,
                  dry_run: bool = False,
                  limit: int = 50) -> dict:
+    """同一任务库只允许一个发送器工作，进程退出时数据库自动释放锁。"""
+    lock = sqlite3.connect(db.current_db_path() + ".delivery-lock.db", timeout=0)
+    try:
+        try:
+            lock.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                return {"sent": 0, "failed": 0, "skipped": 0, "quiet": 0}
+            raise
+        return _drain_outbox(now, sender, dry_run, limit)
+    finally:
+        lock.rollback()
+        lock.close()
+
+
+def _drain_outbox(now: Optional[datetime] = None,
+                  sender: Optional[Callable] = None,
+                  dry_run: bool = False,
+                  limit: int = 50) -> dict:
     """把发件箱里到点的通知发出去。返回统计。
 
     sender 是参数不是写死的：单测里塞一个假函数就能验重试逻辑，
@@ -105,11 +213,27 @@ def drain_outbox(now: Optional[datetime] = None,
     send = sender or _default_sender
 
     for row in rows:
+        if row.kind == notify.INFO_REMINDER_KIND:
+            candidate_uid = row.dedupe_key.removeprefix(notify.INFO_REMINDER_PREFIX)
+            if not notify.info_reminders_enabled() or not notify.candidate_needs_info(
+                repo.get_candidate(candidate_uid), now
+            ):
+                if not dry_run:
+                    repo.mark_notification_skipped(row.uid, "候选已处理或补充提醒已关闭")
+                stats["skipped"] += 1
+                continue
         if notify.is_too_late(row.scheduled_at, now):
-            repo.mark_notification_skipped(row.uid, "超过补发时限，不再打扰")
+            if not dry_run:
+                repo.mark_notification_skipped(row.uid, "超过补发时限，不再打扰")
             stats["skipped"] += 1
             print(f"  [SKIP] {row.dedupe_key} 计划 {row.scheduled_at:%m-%d %H:%M} "
                   f"已经太晚")
+            continue
+
+        if not _refresh_reminder(row, now):
+            if not dry_run:
+                repo.mark_notification_skipped(row.uid, "任务状态或提醒条件已改变")
+            stats["skipped"] += 1
             continue
 
         if dry_run:
@@ -139,9 +263,8 @@ def drain_outbox(now: Optional[datetime] = None,
 def _enqueue_reminders(reminders, now, dry_run: bool, label: str) -> int:
     """把 plan_* 算出来的提醒塞进发件箱。返回真正入队的条数。
 
-    卡片在**入队这一刻**渲染好，不是发送时渲染：中间状态可能已经变了，
-    发送时再渲染会把「明天截止」改成「已完成」，人看得莫名其妙。
-    这与 Day 12 日报的做法一致。
+    入队保存卡片快照。投递前重新检查任务条件，过时提醒跳过，
+    仍符合条件时更新卡片版本及内容。
     """
     queued = 0
     for r in reminders:
@@ -169,6 +292,26 @@ def _enqueue_reminders(reminders, now, dry_run: bool, label: str) -> int:
     return queued
 
 
+def _enqueue_info_reminders(now: datetime, dry_run: bool) -> int:
+    if not notify.info_reminders_enabled() or notify.in_quiet_hours(now):
+        return 0
+    count = 0
+    for cand in repo.list_candidates_for_info_reminder(now, now - notify.INFO_REMINDER_DELAY):
+        if not cand.needs_info:
+            continue
+        key = notify.INFO_REMINDER_PREFIX + cand.uid
+        if dry_run:
+            print(f"  [DRY ] 信息待补充 {key} → {cand.sender_open_id[:12]}…")
+            count += 1
+            continue
+        payload = cards.card_to_content(cards.build_candidate_card(cand))
+        if repo.enqueue_notification(
+            key, cand.sender_open_id, payload, kind=notify.INFO_REMINDER_KIND, scheduled_at=now,
+        ):
+            count += 1
+    return count
+
+
 def tick(now: Optional[datetime] = None, dry_run: bool = False,
          force_plan: bool = False,
          sender: Optional[Callable] = None) -> dict:
@@ -177,16 +320,18 @@ def tick(now: Optional[datetime] = None, dry_run: bool = False,
     sender 一路透传到 drain_outbox：测试注入假发送函数，既能验重试逻辑，
     又不会真往飞书发消息。
 
-    三类提醒的生成节奏不一样，别混：
+    提醒的生成节奏：
     - 日报：每天 9 点之后才规划（should_plan）
     - 到期前 24h / 逾期：每轮都算，靠 dedupe_key 兜住重复，不受 9 点闸门限制
       （「周五 10:00 截止」的任务不该等到周六才提醒）
+    - 信息待补充：候选创建满一小时后，在非免打扰时段仅提醒发起人一次
     """
     now = now or db.now()
     stats = {"expired": 0, "digests": 0, "enqueued": 0, "due": 0, "overdue": 0,
              "sent": 0, "failed": 0, "skipped": 0, "quiet": 0}
 
-    stats["expired"] = repo.expire_candidates()
+    if not dry_run:
+        stats["expired"] = repo.expire_candidates()
 
     if notify.should_plan(now) or force_plan:
         for digest in notify.plan_digests(now):
@@ -220,7 +365,27 @@ def tick(now: Optional[datetime] = None, dry_run: bool = False,
             now, dry_run, "逾期提醒",
         )
 
+    stats["info"] = _enqueue_info_reminders(now, dry_run)
+    stats["task_info"] = 0
+    if os.getenv("TASK_INFO_REMINDER_ENABLED", "1") != "0" and not notify.in_quiet_hours(now):
+        stats["task_info"] = _enqueue_reminders(
+            notify.plan_task_info_reminders(now, repo.last_task_reminder_sent_times(notify.TASK_INFO_KIND)),
+            now, dry_run, "任务待补充",
+        )
     stats.update(drain_outbox(now, sender=sender, dry_run=dry_run))
+    if not dry_run:
+        try:
+            import card_sync
+            card_sync.reconcile()
+        except Exception as exc:
+            print(f"[CARD] 定时卡片同步异常：{type(exc).__name__}")
+    try:
+        import calendar_sync
+        calendar = calendar_sync.reconcile(now, dry_run=dry_run)
+        stats["calendar_checked"] = calendar["checked"]
+        stats["calendar_failed"] = calendar["failed"]
+    except Exception as exc:
+        print(f"[CAL] 定时同步异常：{type(exc).__name__}: {exc}")
     return stats
 
 
@@ -263,8 +428,9 @@ def main() -> None:
         stats = tick(fixed_now, dry_run=args.dry_run, force_plan=args.force_plan)
         print(f"本轮：过期候选 {stats['expired']}　日报 {stats['digests']} 条 "
               f"（入队 {stats['enqueued']}）　到期提醒 {stats['due']}　"
-              f"逾期提醒 {stats['overdue']}　发送 {stats['sent']}　"
+              f"逾期提醒 {stats['overdue']}　待补充 {stats['info']}　发送 {stats['sent']}　"
               f"失败 {stats['failed']}　放弃 {stats['skipped']}"
+              f"　日历检查 {stats.get('calendar_checked', 0)}　日历失败 {stats.get('calendar_failed', 0)}"
               + ("　（免打扰时段，跳过发送）" if stats["quiet"] else ""))
         return
 
@@ -274,8 +440,9 @@ def main() -> None:
             if any(stats.values()):
                 print(f"[{db.now():%H:%M:%S}] 过期 {stats['expired']}　"
                       f"日报 {stats['digests']}　入队 {stats['enqueued']}　"
-                      f"到期 {stats['due']}　逾期 {stats['overdue']}　"
-                      f"发送 {stats['sent']}　失败 {stats['failed']}")
+                      f"到期 {stats['due']}　逾期 {stats['overdue']}　待补充 {stats['info']}　"
+                      f"发送 {stats['sent']}　失败 {stats['failed']}　"
+                      f"日历检查 {stats.get('calendar_checked', 0)}　日历失败 {stats.get('calendar_failed', 0)}")
         except Exception as exc:  # 一轮出错不能让 Worker 死掉
             print(f"[ERROR] tick 失败：{type(exc).__name__}: {exc}")
         time_module.sleep(args.interval)

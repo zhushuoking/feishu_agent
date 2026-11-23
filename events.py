@@ -37,9 +37,12 @@ from typing import List
 import cards
 import db
 import repo
+import permissions
+from models_db import TASK_PENDING_ACCEPTANCE
 
 # 动作 → 给收件人看的一句话。用第二人称写，读的人才知道该干什么。
 SUMMARIES = {
+    "supplement": "补充了任务信息，请查看更新后的任务卡",
     "submit": "提交了交付物，等你验收",
     "accept": "验收通过，任务已完成",
     "reject": "打回了验收，需要继续处理",
@@ -72,8 +75,17 @@ def event_key(task_uid: str, action: str, version: int, open_id: str) -> str:
 
 def recipients(task, action: str, operator_open_id: str = "") -> List[str]:
     """这条变更该告诉谁。空值过滤 + 去重保序 + 不通知操作者本人。"""
-    if action in CREATOR_ACTIONS:
+    if action == "supplement":
+        targets = [*task.owner_open_ids, task.creator_open_id, task.effective_reviewer_open_id]
+    elif action in CREATOR_ACTIONS:
         targets = [task.creator_open_id]
+        if action == "submit":
+            targets.append(task.effective_reviewer_open_id)
+            if not any(permissions.can(task, person, "accept").ok for person in targets if person):
+                targets.extend(sorted(permissions.chat_managers(task.chat_id)))
+            targets = [person for person in targets if person and permissions.can(task, person, "accept").ok]
+        if action == "block":
+            targets.extend(sorted(permissions.chat_managers(task.chat_id)))
     else:
         targets = list(task.owner_open_ids)
     # 自己刚点的按钮，再通知自己一遍纯属噪音。
@@ -92,6 +104,8 @@ def on_transition(result, action: str, from_status: str,
     if not result or not getattr(result, "ok", False) or not result.task:
         return 0
     if action not in NOTIFY_ACTIONS:
+        return 0
+    if action == "submit" and from_status == TASK_PENDING_ACCEPTANCE:
         return 0
 
     task = result.task
