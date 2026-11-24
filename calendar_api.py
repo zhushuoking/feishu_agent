@@ -239,8 +239,7 @@ def add_attendees(calendar_id: str, event_id: str,
                   open_ids: List[str]) -> bool:
     """给日程加参与人。创建日程接口不支持直接传参与人，必须单独调这一下。
 
-    不传 need_notification：该接口默认给新参与人发日程通知，传错字段
-    反而可能触发 190002。参与人必须和应用机器人在同一企业内。
+    建单消息由任务卡发送。静默添加参与人，保留日程及其提醒。
     """
     attendees = [
         {"type": "user", "user_id": open_id}
@@ -253,7 +252,7 @@ def add_attendees(calendar_id: str, event_id: str,
     ok, _, _ = _request(
         "POST", f"{CALENDAR_PATH}/{calendar_id}/events/{event_id}/attendees",
         params={"user_id_type": "open_id"},
-        body={"attendees": attendees},
+        body={"attendees": attendees, "need_notification": False},
     )
     return ok
 

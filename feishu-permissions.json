@@ -2,6 +2,7 @@
   "scopes": {
     "tenant": [
       "contact:user.base:readonly",
+      "task:task:write",
       "im:chat:readonly",
       "im:message",
       "im:message.p2p_msg:readonly",

@@ -22,6 +22,7 @@ from typing import Any, Dict, Optional
 
 import cards
 import events
+import native_task
 import permissions
 import repo
 from models_db import CAND_CONFIRMED, CAND_EXPIRED, CAND_REJECTED
@@ -107,6 +108,10 @@ def _process_candidate(action: str, cid: str, operator_open_id: str,
         # 放后台线程发，回调本身必须秒回（飞书 3 秒不响应会重推）。
         _push_task_card_async(task)
         _reply_task_created_async(cand.message_id, task)
+        try:
+            native_task.on_created_async(task)
+        except Exception as exc:
+            print(f"[NATIVE TASK] {task.uid} 启动同步失败：{exc}")
         # 日历同步：确认建单后去应用主日历建一个「截止前 15 分钟」的占用块。
         # 内部自带开关和后台线程，没开权限时这一行等于什么都没做。
         try:

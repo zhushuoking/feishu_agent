@@ -136,7 +136,7 @@ def build_event_body(task, lead_minutes: Optional[int] = None,
         # 参与人只能看不能改：有人在客户端手改日程，就会和任务状态不一致
         "attendee_ability": "can_see_others",
         "visibility": "default",
-        # 创建时还没有参与人，通知放在 add_attendees 那一步发
+        # 建单消息由任务卡发送，日历只同步日程和到期提醒。
         "need_notification": False,
     }
     reminder = _reminder_minutes()
