@@ -1,0 +1,20 @@
+{
+  "wiki_node": "EXAMPLE_RESOURCE_2",
+  "app_token": "EXAMPLE_RESOURCE_1",
+  "table_id": "example_fixture2",
+  "schema_verified": false,
+  "pending_state": "待进日历",
+  "success_state": "已进日历",
+  "fields": {
+    "议题": "议题",
+    "开始时间": "开始时间",
+    "结束时间": "结束时间",
+    "负责人": "负责人",
+    "来源群": "来源群",
+    "原始消息ID": "原始消息ID",
+    "状态": "状态",
+    "日程ID": "日程ID",
+    "日历ID": "日历ID",
+    "会议链接": "会议链接"
+  }
+}

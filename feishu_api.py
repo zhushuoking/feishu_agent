@@ -250,4 +250,7 @@ def push_task_card(task, card: Optional[Dict[str, Any]] = None) -> Optional[str]
         rendered = card or cards.build_task_card(task, open_id)
         if _deliver_task_card(task, open_id, rendered, kind="task_assignment"):
             sent += 1
-    return "ok" if sent else None
+    expected = len(set(task.owner_open_ids))
+    if sent != expected:
+        print(f"[CARD] 负责人通知未全部送达：成功{sent}，目标{expected}；请核查应用可用范围与私聊权限")
+    return "ok" if expected and sent == expected else None

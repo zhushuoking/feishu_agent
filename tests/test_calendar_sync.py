@@ -17,7 +17,7 @@ from tests.helpers import DEADLINE, make_task
 CREATOR = "ou_sender"
 OWNER = "ou_zhangsan"
 OTHER = "ou_lisi"
-CAL_ID = "feishu.cn_test@group.calendar.feishu.cn"
+CAL_ID = "feishu.cn_fixture4"
 
 
 @pytest.fixture(autouse=True)

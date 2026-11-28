@@ -72,6 +72,11 @@ def on_message(data: P2ImMessageReceiveV1) -> None:
         print(f"[SKIP] 机器人自己的消息 sender_type={cmd.sender_type}")
         return
 
+    # 会议由独立消息级账本去重；默认关闭，不进入任务识别或个人日历。
+    import meeting
+    if meeting.route(cmd):
+        return
+
     # 2) 去重：同一 event_id 只处理一次
     if not store.is_new_event(cmd.event_id, cmd.message_id, cmd.chat_id):
         STATS["duplicate"] += 1
