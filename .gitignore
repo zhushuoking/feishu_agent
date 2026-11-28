@@ -34,3 +34,13 @@ __pycache__/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+.local/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+logs/
+backups/
+config/*_verified.json

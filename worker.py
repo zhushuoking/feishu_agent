@@ -386,6 +386,11 @@ def tick(now: Optional[datetime] = None, dry_run: bool = False,
         stats["calendar_failed"] = calendar["failed"]
     except Exception as exc:
         print(f"[CAL] 定时同步异常：{type(exc).__name__}: {exc}")
+    if not dry_run and os.getenv('MEETING_ENABLED','0')=='1':
+        from meeting import Ledger, SDKTable
+        from meeting_jobs import tick as meeting_tick
+        import feishu_api
+        meeting_tick(Ledger(os.environ['MEETING_DB']), SDKTable(), feishu_api.send_text_to_user)
     return stats
 
 

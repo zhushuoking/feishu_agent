@@ -1,5 +1,6 @@
 """个人日历一次授权、加密保存与自动续期。回调仅绑定实际登录的飞书账号。"""
 
+import time
 import base64
 import hashlib
 import json
@@ -26,6 +27,28 @@ from models_db import CalendarAccount, CalendarOAuthState, PersonalCalendarEvent
 
 SCOPES = "auth:user.id:read calendar:calendar calendar:calendar:readonly offline_access"
 app = FastAPI(docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def controlled_endpoints(request, call_next):
+    if os.getenv("CALENDAR_CONTROLLED_OAUTH", "0") == "1":
+        if request.method != "GET" or request.url.path not in ("/calendar/authorize", "/calendar/callback"):
+            return PlainTextResponse("Not found", status_code=404)
+        from scripts.live_boundary import Guard, Denied
+        try:
+            guard = Guard(os.environ["LIVE_AUTHORIZATION_FILE"], os.environ["LIVE_AUTHORIZATION_SHA256"])
+            if guard.a.get('mode')=='autonomous':
+                if not guard.a.get('new_oauth') or time.time()>=guard.a.get('oauth_until',0):raise Denied('OAuth window closed')
+                if request.url.path.endswith('authorize') and request.query_params.get('user_id')!=guard.a.get('oauth_owner'):raise Denied('OAuth owner mismatch')
+                if request.url.path.endswith('callback'):
+                    state_hash=hashlib.sha256(request.query_params.get('state','').encode()).hexdigest()
+                    with db.session_scope() as session:
+                        state=session.get(CalendarOAuthState,state_hash)
+                        if state is None or state.open_id!=guard.a.get('oauth_owner'):raise Denied('OAuth state owner mismatch')
+            guard.reserve("oauth_callback" if request.url.path.endswith("callback") else "oauth_start")
+        except (Denied, KeyError):
+            return PlainTextResponse("授权窗口不可用，请联系维护人", status_code=403)
+    return await call_next(request)
 
 
 class AuthorizationRequired(RuntimeError):
@@ -122,6 +145,10 @@ def begin_authorization(open_id: str) -> str:
     redirect_uri = base_url() + "/calendar/callback"
     with db.session_scope() as session:
         tasks = list(session.scalars(select(Task)).all())
+        if os.getenv("CALENDAR_OWNER_ONLY", "0") == "1":
+            cutoff = os.getenv("CALENDAR_NEW_TASK_AFTER_ID", "")
+            tasks = [task for task in tasks if cutoff.isdigit() and task.id > int(cutoff)
+                     and open_id in task.owner_open_ids]
         permitted = any(permissions.chat_enabled(task.chat_id) and open_id in {
             *task.owner_open_ids, task.creator_open_id, task.effective_reviewer_open_id,
         } for task in tasks)

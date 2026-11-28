@@ -9,7 +9,14 @@
       "im:message.group_at_msg:readonly",
       "im:message.group_msg",
       "im:message:send_as_bot",
-      "im:resource"
+      "im:resource",
+      "wiki:node:read",
+      "base:table:read",
+      "base:field:read",
+      "base:record:create",
+      "base:record:read",
+      "base:record:update",
+      "base:record:retrieve"
     ],
     "user": [
       "auth:user.id:read",

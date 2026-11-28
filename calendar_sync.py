@@ -185,6 +185,16 @@ def sync_task(task_uid: str, api=None, accounts=None) -> Dict[str, int]:
     """按最新任务同步。跨线程、跨进程互斥，失败留到 Worker 重试。"""
     stats = {"created": 0, "attendees": 0, "updated": 0,
              "deleted": 0, "skipped": 0, "failed": 0}
+    if os.getenv("CALENDAR_PERSONAL_NEW_ONLY", "0") == "1":
+        cutoff = os.getenv("CALENDAR_NEW_TASK_AFTER_ID", "")
+        task = repo.get_task(task_uid)
+        if not cutoff.isdigit() or task is None or task.id <= int(cutoff):
+            stats["skipped"] = 1
+            return stats
+        legacy = repo.get_calendar_event(task_uid)
+        if legacy and legacy.sync_mode != "personal" and (legacy.event_id or legacy.request_body):
+            stats["failed"] = 1
+            return stats  # 已有旧邀请日程须人工核查，禁止恢复创建或删除
     lock = sqlite3.connect(db.current_db_path() + ".calendar-lock.db", timeout=0)
     try:
         try:
@@ -319,7 +329,16 @@ def _sync_personal_task(task_uid: str, legacy_api, accounts, stats) -> None:
     aggregate = repo.get_calendar_event(task_uid) or repo.reserve_calendar_event(task_uid, "", task.deadline_at)
     recipients = {person for person in [*task.owner_open_ids, task.creator_open_id,
                                        task.effective_reviewer_open_id] if person}
+    if os.getenv("CALENDAR_OWNER_ONLY", "0") == "1":
+        recipients = set(task.owner_open_ids)
     existing = {row.open_id: row for row in repo.list_personal_calendar_events(task_uid)}
+    if os.getenv("CALENDAR_PERSONAL_NEW_ONLY", "0") == "1":
+        if any(person not in recipients for person in existing):
+            stats["failed"] += 1
+            return  # 不擅自清理之前的非负责人副本
+        repo.mark_calendar_sync_mode(task_uid, "personal")
+        aggregate = repo.get_calendar_event(task_uid)
+
     errors = []
     for open_id in sorted(recipients | existing.keys()):
         row = existing.get(open_id) or repo.reserve_personal_calendar_event(task_uid, open_id)
@@ -334,6 +353,11 @@ def _sync_personal_task(task_uid: str, legacy_api, accounts, stats) -> None:
             stats["failed"] += 1
     if errors:
         repo.defer_calendar_sync(task_uid, "；".join(errors))
+        return
+
+    if os.getenv("CALENDAR_PERSONAL_NEW_ONLY", "0") == "1":
+        repo.mark_calendar_event_attendees_synced(task_uid)
+        repo.finish_calendar_sync(task_uid, task.version, task.deadline_at)
         return
 
     # 旧创建请求超时后可能已在远端成功，恢复 ID 后再清理。
@@ -368,6 +392,8 @@ def _sync_personal_event(task, is_recipient: bool, row, accounts, stats) -> None
                                             last_error=None)
         stats["skipped"] += 1
         return
+    if os.getenv("CALENDAR_PERSONAL_NEW_ONLY", "0") == "1" and row.request_body and not row.event_id:
+        raise PersonalSyncError("日程创建结果待人工核查，禁止自动重发")
     calendar_id, api = accounts.api_for_user(row.open_id)
     if row.calendar_id and row.calendar_id != calendar_id:
         raise PersonalSyncError("个人主日历发生变化，请检查账号日历配置")

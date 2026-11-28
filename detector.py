@@ -24,22 +24,32 @@ def _validate_mentions(result: TaskRecognition, mentions: List[Mention]) -> Task
     这是防「模型幻觉造人」的最后一道闸。文档 8.3.1 要求 assignee_mention_ids
     只能引用当前消息 mentions 中的标识，但提示词管不住，必须在代码里卡。
     """
-    valid = {m.open_id for m in mentions if m.open_id} | {m.key for m in mentions if m.key}
-
+    import os
+    bot_id = os.getenv("FEISHU_BOT_OPEN_ID", "")
+    mapping = {}
+    ambiguous = set()
+    for m in mentions:
+        if (not re.fullmatch(r"ou_[A-Za-z0-9_]+", m.open_id or "")
+                or m.open_id == bot_id or m.key in ("all", "@all", "@_all")):
+            continue
+        for token in (m.open_id, m.key):
+            if not token:
+                continue
+            if token in mapping and mapping[token] != m.open_id:
+                ambiguous.add(token)
+            mapping[token] = m.open_id
+    for token in ambiguous:
+        mapping.pop(token, None)
     for task in result.tasks:
-        kept = [mid for mid in task.assignee_mention_ids if mid in valid]
-        dropped = [mid for mid in task.assignee_mention_ids if mid not in valid]
+        supplied = task.assignee_mention_ids
+        kept = list(dict.fromkeys(mapping[token] for token in supplied if token in mapping))
+        unresolved = any(token not in mapping for token in supplied)
         task.assignee_mention_ids = kept
-        if kept:
-            # 有人了就从缺失字段里去掉 assignee
-            task.missing_fields = [f for f in task.missing_fields if f != "assignee"]
-        elif dropped:
-            # 模型给了人但全是不存在的 ID，视为缺失负责人
-            if "assignee" not in task.missing_fields:
-                task.missing_fields.append("assignee")
-        else:
-            if "assignee" not in task.missing_fields:
-                task.missing_fields.append("assignee")
+        task.missing_fields = [f for f in task.missing_fields if f != "assignee"]
+        if not kept or unresolved:
+            task.missing_fields.append("assignee")
+            result.clarification_needed = True
+            result.clarification_question = "部分负责人无法从真实@成员取得有效身份，请人工核实后重新指定负责人。"
     return result
 
 

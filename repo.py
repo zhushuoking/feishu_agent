@@ -229,6 +229,9 @@ def confirm_candidate(uid: str, operator_open_id: str = "",
             raise CandidateActionError("请先补充任务内容，再确认建单")
         if not (cand.sender_open_id or "").strip():
             raise CandidateActionError("请先补充发起人，再确认建单")
+        if assignee_open_ids is None and "assignee" in (cand.missing_fields or []):
+            raise CandidateActionError("负责人身份尚未核实，请补充有效负责人后再确认")
+        owners = list(dict.fromkeys(owners))
         if not owners or not all(isinstance(owner, str) and owner.startswith("ou_")
                                  and owner[3:].strip() and owner == owner.strip() for owner in owners):
             raise CandidateActionError("请先补充有效的负责人，再确认建单")
@@ -999,11 +1002,17 @@ def prepare_calendar_request(task_uid: str, request_body: str) -> str:
 def pending_calendar_tasks(now, limit: int = 50, chat_ids=None, mode: str = "application") -> List[str]:
     """选取缺失、落后或失败到期的日程，也覆盖创建前进程退出的情况。"""
     row = TaskCalendarEvent
+    import os
+    cutoff = os.getenv("CALENDAR_NEW_TASK_AFTER_ID", "")
+    strict = os.getenv("CALENDAR_PERSONAL_NEW_ONLY", "0") == "1"
+    if strict and not cutoff.isdigit():
+        return []
     with db.session_scope() as s:
         return list(s.scalars(
             select(Task.uid)
             .outerjoin(row, row.task_uid == Task.uid)
             .where(
+                Task.id > int(cutoff) if strict else True,
                 Task.chat_id.in_(chat_ids) if chat_ids is not None else True,
                 or_(row.retry_at.is_(None), row.retry_at <= now),
                 or_(
